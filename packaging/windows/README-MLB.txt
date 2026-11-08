@@ -5,6 +5,17 @@ A native port: the original PS4 game code runs directly on Windows. No game file
 included. You need your own decrypted dump of MLB The Show 24 (CUSA43942): the folder with
 eboot.bin, PS4\, sce_module\ and sce_sys\.
 
+Disclaimer
+- Unofficial fan project: not affiliated with, endorsed by or sponsored by Sony Interactive
+  Entertainment, San Diego Studio, Major League Baseball, the MLB Players Association or their
+  partners. "MLB The Show" and "MLB" are trademarks of their owners, named here only to say
+  which game this port works with.
+- No game files are included. Use your own legally obtained copy of the game; this package does
+  not provide game files, decryption keys or tools that bypass copy protection.
+- Provided as is, without any warranty (see LICENSE).
+- Proyecto no oficial, sin relacion con Sony, San Diego Studio, MLB ni la MLBPA. No incluye
+  archivos del juego: necesitas tu propia copia legal.
+
 Requirements
 - Windows 10 (1903 or later) or Windows 11, 64-bit.
 - A Vulkan 1.3 graphics card with a current driver (tested on a GeForce GTX 1650, 4 GB).

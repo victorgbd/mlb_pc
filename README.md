@@ -8,6 +8,24 @@ included: players need their own decrypted dump (the folder with `eboot.bin`, `P
 Players: see [packaging/windows/README-MLB.txt](packaging/windows/README-MLB.txt) (it ships as
 `README.txt` in the package). Port notes, fixes and known gaps: [docs/MLB_PORT.md](docs/MLB_PORT.md).
 
+## Disclaimer
+
+This is an unofficial fan project. It is not affiliated with, endorsed by or sponsored by Sony
+Interactive Entertainment, San Diego Studio, Major League Baseball, the MLB Players Association
+or any of their partners. "MLB The Show", "MLB" and the related names and logos are trademarks
+of their owners; they appear here only to say which game this port works with.
+
+- No game files are included in this repository or in its packages, and none will be.
+- You need your own legally obtained copy of the game. This project does not provide, link to
+  or explain how to obtain game files, decryption keys or tools that bypass copy protection;
+  requests for them, and links to them, will be removed.
+- Online features are not supported and the port does not connect to Sony's or MLB's servers.
+- The software is provided as is, without any warranty (see LICENSE).
+
+*Proyecto no oficial, sin relación con Sony Interactive Entertainment, San Diego Studio, MLB ni
+la MLBPA. No incluye archivos del juego: necesitas tu propia copia legal. No se facilitan
+archivos del juego, claves ni herramientas para saltarse la protección anticopia.*
+
 ## Build
 
 Install [MSYS2](https://www.msys2.org) (`winget install MSYS2.MSYS2`), open the
