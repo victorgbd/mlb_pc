@@ -13,8 +13,9 @@
  *   pad_vibration=1  pad_vibration_strength=100
  *
  * Defaults (no file): WASD move, mouse look, left button R2 (fire), right button L2 (aim),
- * Space Cross, C Circle, F Square, E Triangle, Q L1, G R1, Left Shift L3, V R3, Escape/Enter
- * Options, Tab touchpad, arrow keys and the wheel the d-pad, IJKL the right stick. */
+ * Space Cross, C Circle, F Square, E Triangle, Q L1, G R1, Left Shift L3, V R3, Enter Options,
+ * Tab touchpad, arrow keys and the wheel the d-pad, IJKL the right stick. Escape is never a game
+ * button: it asks whether to quit (gpu/shim/bbport_overlay.cpp). */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
@@ -115,7 +116,7 @@ static const Action actions[ACTIONS]={
     {"triangle",BTN_TRIANGLE,"E","y"}, {"l1",BTN_L1,"Q","leftshoulder"}, {"r1",BTN_R1,"G","rightshoulder"},
     {"l2",BTN_L2,"Mouse Right","lefttrigger"}, {"r2",BTN_R2,"Mouse Left","righttrigger"},
     {"l3",BTN_L3,"Left Shift","leftstick"}, {"r3",BTN_R3,"V","rightstick"},
-    {"options",BTN_OPTIONS,"Escape|Return","start"}, {"touchpad",BTN_TOUCHPAD,"Tab","back"},
+    {"options",BTN_OPTIONS,"Return","start"}, {"touchpad",BTN_TOUCHPAD,"Tab","back"},
     {"up",BTN_UP,"Up","dpup"}, {"down",BTN_DOWN,"Down","dpdown"},
     {"left",BTN_LEFT,"Left|Wheel Up","dpleft"}, {"right",BTN_RIGHT,"Right|Wheel Down","dpright"},
     {"ls_up",0,"W",NULL}, {"ls_down",0,"S",NULL}, {"ls_left",0,"A",NULL}, {"ls_right",0,"D",NULL},
@@ -130,7 +131,7 @@ static struct {
     float mouse_sensitivity;
 } input;
 
-/* Whether `name` is one of the keys in `defaults` ("Escape|Return"). */
+/* Whether `name` is one of the keys in `defaults` ("Left|Wheel Up"). */
 static int default_key(const char *name, const char *defaults) {
     const size_t length=strlen(name);
     for (const char *d=defaults; d && *d; ) {
@@ -163,6 +164,12 @@ static void set_keys(int action, const char *value) {
     if (second) *second++=0;
     if (*text) input.keys[action][0]=parse_bind(text,actions[action].keys);
     if (second && *second) input.keys[action][1]=parse_bind(second,actions[action].keys);
+    /* Escape opens the quit prompt (an older input.ini may still bind it to Options). */
+    for (int i=0;i<2;++i) {
+        const Bind b=input.keys[action][i];
+        if ((b.kind==BIND_KEY && b.code==SDL_SCANCODE_ESCAPE) || (b.kind==BIND_LAYOUT && b.code==(int32_t)SDLK_ESCAPE))
+            input.keys[action][i]=(Bind){0,0};
+    }
 }
 static int parse_pad(const char *value) {
     if (!SDL_strcasecmp(value,"lefttrigger")) return PAD_TRIGGER_LEFT;

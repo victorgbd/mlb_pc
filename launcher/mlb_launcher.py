@@ -33,6 +33,7 @@ sys.path.insert(0, str(PORT_DIR / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import trophies  # noqa: E402  (scripts/trophies.py: the game's trophy list)
 import mlb_i18n  # noqa: E402
+import pkg_install  # noqa: E402
 
 DATA_DIR = Path(os.environ.get('BB_DATA_DIR', PORT_DIR))
 CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'mlb-launcher'
@@ -83,7 +84,7 @@ BUTTON_ACTIONS = [
     ('l1', 'L1', 'Q', 'leftshoulder'), ('r1', 'R1', 'G', 'rightshoulder'),
     ('l2', 'L2', 'Z', 'lefttrigger'), ('r2', 'R2', 'X', 'righttrigger'),
     ('l3', 'L3', 'Left Shift', 'leftstick'), ('r3', 'R3', 'V', 'rightstick'),
-    ('options', 'Options', 'Escape|Return', 'start'), ('touchpad', 'Touchpad', 'Tab', 'back'),
+    ('options', 'Options', 'Return', 'start'), ('touchpad', 'Touchpad', 'Tab', 'back'),
     ('up', 'D-pad up', 'Up', 'dpup'), ('down', 'D-pad down', 'Down', 'dpdown'),
     ('left', 'D-pad left', 'Left', 'dpleft'), ('right', 'D-pad right', 'Right', 'dpright'),
 ]
@@ -120,8 +121,9 @@ TK_KEYS = {'space': 'Space', 'Return': 'Return', 'Escape': 'Escape', 'Tab': 'Tab
 # Tk on Windows names numpad keys like the main ones ("8", "plus"), only the keycode tells them apart.
 WIN_NUMPAD = {**{0x60 + n: f'Keypad {n}' for n in range(10)},
               0x6A: 'Keypad *', 0x6B: 'Keypad +', 0x6D: 'Keypad -', 0x6E: 'Keypad .', 0x6F: 'Keypad /'}
-# Insert opens the in-game settings menu.
-RESERVED_KEYS = {'Insert': 'Insert opens the in-game settings menu.'}
+# Insert opens the in-game settings menu; Escape asks whether to quit the game.
+RESERVED_KEYS = {'Insert': 'Insert opens the in-game settings menu.',
+                 'Escape': 'Escape asks whether to quit the game.'}
 # Graphics fixes of the port that are on by default; turning one off is only for comparing.
 GRAPHICS_FIXES = [
     ('fix_crowd', 'BB_IMAGE_TABLES', 'Crowd textures',
@@ -422,6 +424,7 @@ class Launcher:
         self.cover_key = self.cover_image = None
         self.info = None
         self.update_box = None
+        self.pkg_job = None  # a PKG install in progress: {'process', 'cancelled', 'progress', 'text'}
         root.title(f'{NAME} — {_("PC port")} · {_("by {}").format(AUTHOR)}')
         root.configure(bg=BG)
         self.dpi = root.winfo_fpixels('1i') / 96.0
@@ -543,6 +546,8 @@ class Launcher:
         s.configure('Vertical.TScrollbar', background='#22304f', arrowcolor=MUTED, troughcolor=SURFACE,
                     bordercolor=SURFACE, lightcolor='#22304f', darkcolor='#22304f', gripcount=0, arrowsize=12)
         s.map('Vertical.TScrollbar', background=[('active', '#2e3f66')])
+        s.configure('Accent.Horizontal.TProgressbar', background=ACCENT, troughcolor=CARD_HI, bordercolor=CARD_HI,
+                    lightcolor=ACCENT, darkcolor=ACCENT, thickness=self.px(8))
 
     # ---- widget helpers ----------------------------------------------------------------------
     def var(self, key):
@@ -1089,6 +1094,21 @@ class Launcher:
                     _('The folder with eboot.bin, PS4\\ and sce_sys\\.'), on_change=self.refresh)
         self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'),
                     _('Empty: the user folder next to the launcher.'))
+        card = self.section(f, _('Install from PKG'))
+        self.note(f, _('Unpack the game from its PKG file (a fake PKG made from your own copy), and its update '
+                       'PKG if you have one. The game folder is set when it finishes.'), top=2)
+        holder = self.buttons_row(f)
+        self.pkg_button = self.pill(holder, _('Install from PKG…'), self.install_pkg)
+        self.pkg_button.pack(side='left')
+        self.pkg_cancel_button = self.pill(holder, _('Cancel'), self.cancel_pkg, kind='ghost')
+        self.pkg_cancel_button.pack(side='left', padx=(8, 0))
+        self.pkg_bar = self.ttk.Progressbar(card, style='Accent.Horizontal.TProgressbar', orient='horizontal',
+                                            mode='determinate', maximum=1000, length=self.px(520))
+        self.pkg_bar.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(14, 0))
+        self.pkg_status = self.ttk.Label(card, text='', style='Muted.TLabel', wraplength=self.px(640),
+                                         justify='left')
+        self.pkg_status.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(6, 0))
+        self.show_pkg_state()
         self.section(f, _('Console'))
         self.row(f, _('Language'), self.choice(f, 'language', LANGUAGES, 30),
                  _('The language the PS4 would be set to; the game uses it for text and commentary.'))
@@ -1128,7 +1148,7 @@ class Launcher:
         self.capturing = None
         self.section(f, _('Keyboard'), top=6)
         self.note(f, _('Click a box, then press a key. ✕ removes a binding. Each PS4 button can have two keys. '
-                       'Insert opens the in-game settings menu.'), top=2)
+                       'Insert opens the in-game settings menu; Escape asks whether to quit the game.'), top=2)
         card = self.target(f)
         table = self.tk.Frame(card, bg=CARD)
         table.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(10, 0))
@@ -1592,6 +1612,10 @@ class Launcher:
     def play(self):
         if self.process:
             return
+        if self.pkg_job:
+            self.messagebox.showinfo(NAME, _('Wait until the PKG install finishes.'))
+            self.show('game')
+            return
         self.collect()
         folder = game_folder(self.app)
         if not folder or not Path(folder).is_dir() or not game_available(self.app):
@@ -1809,6 +1833,218 @@ class Launcher:
             self.messagebox.showerror(NAME, _('Could not clear the shader cache: {}').format(error))
             return
         self.messagebox.showinfo(NAME, _('Shader cache cleared. The next start stutters for a while as it is rebuilt.'))
+
+    # ---- install from PKG ----------------------------------------------------------------------
+    def show_pkg_state(self):
+        """The PKG card as the install stands (also after the interface is rebuilt)."""
+        job = self.pkg_job
+        self.pkg_button.configure(state='disabled' if job else 'normal')
+        self.pkg_cancel_button.configure(state='normal' if job and not job['cancelled'] else 'disabled')
+        if job:
+            self.pkg_bar.grid()
+            self.pkg_bar['value'] = int(job['progress'] * 1000)
+            self.pkg_status.configure(text=job['text'])
+        else:
+            self.pkg_bar.grid_remove()
+
+    def pkg_progress(self, fraction, text):
+        if not self.pkg_job:
+            return
+        self.pkg_job['progress'], self.pkg_job['text'] = fraction, text
+        self.show_pkg_state()
+        if not self.process:
+            self.status.configure(text=text, fg=ACCENT)
+
+    def choose_pkgs(self):
+        """The chosen PKGs in install order (the game, then its updates), or None."""
+        paths = self.filedialog.askopenfilenames(
+            title=_('Choose the game PKG (and its update PKG)'),
+            initialdir=self.app.get('pkg_dir') or str(Path.home() / 'Downloads'),
+            filetypes=[(_('PS4 packages'), '*.pkg'), (_('All files'), '*.*')])
+        if not paths:
+            return None
+        self.app['pkg_dir'] = str(Path(paths[0]).parent)
+        pkgs = []
+        for path in paths:
+            try:
+                pkgs.append(pkg_install.read_pkg(path))
+            except (OSError, ValueError) as error:
+                reason = _('this is not a PS4 PKG file.') if isinstance(error, ValueError) else error
+                self.messagebox.showerror(NAME, f'{Path(path).name}: {reason}')
+                return None
+        for pkg in pkgs:
+            if pkg['kind'] == 'dlc':
+                self.messagebox.showerror(NAME, _('{} is downloadable content (DLC). Only the game and its updates '
+                                                  'can be installed here.').format(pkg['path'].name))
+                return None
+            if pkg['kind'] == 'other':
+                self.messagebox.showerror(NAME, _('{} is not a game or an update PKG.').format(pkg['path'].name))
+                return None
+            if pkg['delta']:
+                self.messagebox.showerror(NAME, _('{} is a delta update (only the changed parts of the files): it '
+                                                  'cannot be unpacked over the game. Use a full update PKG.').format(
+                                              pkg['path'].name))
+                return None
+        games = [p for p in pkgs if p['kind'] == 'game']
+        if len(games) > 1:
+            self.messagebox.showerror(NAME, _('Choose only one game PKG (updates can go with it).'))
+            return None
+        if len({p['title_id'] for p in pkgs}) > 1:
+            self.messagebox.showerror(NAME, _('These PKGs are for different games: {}.').format(
+                ', '.join(sorted({p['title_id'] for p in pkgs}))))
+            return None
+        title_id = pkgs[0]['title_id']
+        if title_id != GAME_ID and not self.messagebox.askyesno(NAME, _(
+                'This PKG is {} ({}), not {} ({}). This port is made for {}. Install it anyway?').format(
+                    pkgs[0]['title'] or _('another game'), title_id, GAME_TITLE, GAME_ID, GAME_ID)):
+            return None
+        return games + sorted((p for p in pkgs if p['kind'] == 'update'), key=lambda p: pkg_install.version_key(p['version']))
+
+    def install_pkg(self):
+        if self.pkg_job:
+            return
+        if self.process:
+            self.messagebox.showinfo(NAME, _('Close the game before installing.'))
+            return
+        tool = pkg_install.tool_path(PORT_DIR)
+        if not tool:
+            self.messagebox.showerror(NAME, _('ps4-pkg-tool.exe was not found in the bin folder.'))
+            return
+        plan = self.choose_pkgs()
+        if not plan:
+            return
+        title_id = plan[0]['title_id']
+        if plan[0]['kind'] == 'game':
+            chosen = self.filedialog.askdirectory(
+                title=_('Where to install the game (a {} folder is made inside)').format(title_id),
+                initialdir=self.app.get('install_dir') or str(plan[0]['path'].parent))
+            if not chosen:
+                return
+            self.app['install_dir'] = chosen
+            chosen = Path(chosen)
+            target = chosen if chosen.name.upper() == title_id.upper() else chosen / title_id
+            if target.is_dir() and any(target.iterdir()):
+                question = _('There is already a game in {}. Replace its files?') if (target / GAME_EXE).is_file() \
+                    else _('{} is not empty. Unpack the game into it anyway?')
+                if not self.messagebox.askyesno(NAME, question.format(target)):
+                    return
+        else:
+            folder = game_folder(self.current())
+            if not game_available(self.current()):
+                self.messagebox.showerror(NAME, _('Choose the game PKG too, or set the game folder first: the update '
+                                                  'is unpacked over the game.'))
+                return
+            target = Path(folder)
+            installed = game_info(folder)
+            if installed and installed['id'] != title_id:
+                self.messagebox.showerror(NAME, _('This update is for {}, but the game folder holds {}.').format(
+                    title_id, installed['id']))
+                return
+            versions = ', '.join(p['version'] for p in plan)
+            if not self.messagebox.askyesno(NAME, _('Install update {} into {}?').format(versions, target)):
+                return
+        need = sum(p['size'] for p in plan)
+        place = next((p for p in (target, *target.parents) if p.exists()), None)
+        try:
+            free = shutil.disk_usage(place).free if place else need
+        except OSError:
+            free = need
+        if free < need * 1.05 and not self.messagebox.askyesno(NAME, _(
+                'The game needs about {:.1f} GB and the drive has {:.1f} GB free. Install anyway?').format(
+                    need / 1e9, free / 1e9)):
+            return
+        self.collect()
+        created = not target.exists()
+        self.pkg_job = {'process': None, 'cancelled': False, 'progress': 0.0, 'text': _('Reading the PKG…'),
+                        'target': target, 'created': created}
+        self.set_log('')
+        self.show_pkg_state()
+        threading.Thread(target=self.run_pkg_install, args=(tool, plan, target, created), daemon=True).start()
+
+    def run_pkg_install(self, tool, plan, target, created):
+        """Helper thread: unpacks the PKGs one after the other into the game folder."""
+        job = self.pkg_job
+        total = sum(p['size'] for p in plan) or 1
+        before, error = 0, ''
+
+        def started(process):
+            job['process'] = process
+            if job['cancelled']:
+                pkg_install_stop(process)
+
+        for pkg in plan:
+            if job['cancelled']:
+                break
+            what = _('the game') if pkg['kind'] == 'game' else _('update {}').format(pkg['version'])
+            self.ui_calls.put(lambda w=what, b=before: self.pkg_progress(b / total, _('Unpacking {}…').format(w)))
+
+            def progress(done, size, w=what, b=before, weight=pkg['size']):
+                fraction = (b + weight * done / size) / total if size else b / total
+                self.ui_calls.put(lambda: self.pkg_progress(fraction, _('Unpacking {}… {}%  ({:.1f} of {:.1f} GB)').format(
+                    w, int(done * 100 / size) if size else 0, done / 1e9, size / 1e9)))
+
+            def line(text):
+                self.output.put(text + '\n')
+            try:
+                code, failure = pkg_install.extract(tool, pkg['path'], target, progress, line, started)
+            except OSError as failure_error:
+                code, failure = 1, str(failure_error)
+            job['process'] = None
+            if job['cancelled']:
+                break
+            if code:
+                error = failure or _('ps4-pkg-tool exited with code {}').format(code)
+                break
+            before += pkg['size']
+        if not error and not job['cancelled'] and plan[0]['kind'] == 'game' and not (target / GAME_EXE).is_file():
+            error = _('The PKG was unpacked, but it holds no {}.').format(GAME_EXE)
+        removed = False
+        if (error or job['cancelled']) and created and plan[0]['kind'] == 'game':
+            self.ui_calls.put(lambda: self.pkg_progress(job['progress'], _('Removing the unfinished install…')))
+            shutil.rmtree(target, ignore_errors=True)
+            removed = not target.exists()
+        self.ui_calls.put(lambda: self.pkg_finished(plan, target, error, job['cancelled'], removed))
+
+    def pkg_finished(self, plan, target, error, cancelled, removed):
+        self.pkg_job = None
+        self.show_pkg_state()
+        self.pkg_status.configure(text='')
+        game = plan[0]['kind'] == 'game'
+        if cancelled or error:
+            if removed:
+                detail = _('The unfinished files were removed.')
+            elif game:
+                detail = _('The folder {} holds an unfinished install.').format(target)
+            else:
+                detail = _('The game folder may now hold a partial update: install the game PKG again if it does '
+                           'not start.')
+            text = _('The install was cancelled.') if cancelled else _('The install failed: {}').format(error)
+            self.pkg_status.configure(text=text)
+            self.refresh()
+            if not cancelled:
+                self.messagebox.showerror(NAME, text + '\n\n' + detail)
+            elif not removed:
+                self.messagebox.showinfo(NAME, text + '\n\n' + detail)
+            return
+        if game:
+            self.var('game_dir').set(str(target))
+        self.collect()
+        self.refresh()
+        info = game_info(str(target)) or {'title': GAME_TITLE, 'version': '?'}
+        text = _('{} {} is installed in {}.').format(info['title'], info['version'], target)
+        self.pkg_status.configure(text=text)
+        self.messagebox.showinfo(NAME, text + ('\n\n' + _('The game folder is set: press Play.') if game else ''))
+
+    def cancel_pkg(self):
+        job = self.pkg_job
+        if not job or job['cancelled']:
+            return
+        if not self.messagebox.askyesno(NAME, _('Stop the install?')):
+            return
+        job['cancelled'] = True
+        if job['process']:
+            pkg_install_stop(job['process'])
+        self.pkg_progress(job['progress'], _('Stopping…'))
 
     def shortcut(self):
         """Name and icon of the desktop shortcut, then create it."""
@@ -2074,6 +2310,19 @@ class Launcher:
                                          'this launcher.'))
 
     def close(self):
+        job = self.pkg_job
+        if job:
+            if not self.messagebox.askyesno(NAME, _('A PKG install is running. Stop it and close?')):
+                return
+            job['cancelled'] = True
+            if job['process']:
+                pkg_install_stop(job['process'])
+                try:
+                    job['process'].wait(10)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            if job['created']:
+                shutil.rmtree(job['target'], ignore_errors=True)
         try:
             self.collect()
         except Exception:  # never keep the window open over a settings problem
@@ -2116,6 +2365,15 @@ def terminate_process_tree(process):
     if result.returncode and process.poll() is None:
         detail = result.stdout.decode(errors='replace').strip()
         raise OSError(detail or _('taskkill exited with code {}').format(result.returncode))
+
+
+def pkg_install_stop(process):
+    """Ends a running ps4-pkg-tool (it starts nothing of its own)."""
+    try:
+        if process.poll() is None:
+            process.kill()
+    except OSError:
+        pass
 
 
 def version_tuple(text):

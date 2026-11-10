@@ -153,7 +153,8 @@ void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
     Store(value, v, changed);
 }
 
-// Quit game: the confirmation's labels.
+// Quit game: the confirmation's labels, in Spanish when the console language is Spanish
+// (BB_LANGUAGE 3 = Spain, 20 = Latin America, set by the launcher).
 struct QuitText {
     const char *button, *title, *body, *quit, *cancel, *quitting;
 };
@@ -162,9 +163,20 @@ const QuitText& Quitting() {
                              "Progress since the last save is lost. A save in progress is "
                              "finished first.",
                              "Quit", "Cancel", "Quitting..."};
-    return en;
+    static const QuitText es{"Salir del juego", "\xc2\xbfSalir del juego?",
+                             "Se pierde el progreso desde el \xc3\xbaltimo guardado. Si hay un "
+                             "guardado en curso, se termina primero.",
+                             "Salir", "Cancelar", "Saliendo..."};
+    static const bool spanish = [] {
+        const char* language = std::getenv("BB_LANGUAGE");
+        return language && (!std::strcmp(language, "3") || !std::strcmp(language, "20"));
+    }();
+    return spanish ? es : en;
 }
 std::atomic<bool> quitting{false};
+// Escape outside the menu: the quit confirmation on its own (QuitPrompt). Window thread opens and
+// cancels it, the present thread draws it; guarded by imgui_mutex like the rest of ImGui's state.
+std::atomic<bool> quit_prompt{false};
 
 // The same exit as closing the window (SDL_EVENT_QUIT ends the window thread's loop), once a save
 // in progress has finished (at most 5 seconds).
@@ -470,6 +482,59 @@ void Menu() {
     ImGui::End();
     if (!keep_open) {
         SetOpen(false);
+    }
+}
+
+void SetQuitPrompt(bool value) {
+    quit_prompt = value;
+    ImGui::GetIO().MouseDrawCursor = value || menu_open;
+}
+
+// Escape: "Quit the game?" in the middle of the screen over a dimmed game. Cancel has the
+// focus (Enter or Cross on it does not quit); Escape again, or Circle, cancels.
+void QuitPrompt() {
+    const QuitText& q = Quitting();
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        viewport->Pos, ImVec2(viewport->Pos.x + viewport->Size.x, viewport->Pos.y + viewport->Size.y),
+        IM_COL32(0, 0, 0, 110));
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowFocus();
+    ImGui::Begin("##quit_prompt", nullptr,
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoCollapse);
+    ImGui::TextUnformatted(q.title);
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+    ImGui::TextDisabled("%s", q.body);
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    bool cancel = false;
+    if (quitting) {
+        ImGui::TextUnformatted(q.quitting);
+    } else {
+        if (ImGui::Button(q.quit)) {
+            if (dirty) {
+                dirty = false;
+                BbSettings::Save();
+            }
+            Quit(); // the prompt stays up, showing "Quitting...", until the window closes
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(q.cancel)) {
+            cancel = true;
+        }
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere(-1);
+        }
+        ImGui::SetItemDefaultFocus();
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
+            cancel = true;
+        }
+    }
+    ImGui::End();
+    if (cancel) {
+        SetQuitPrompt(false);
     }
 }
 
@@ -798,14 +863,27 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
     ImGuiIO& io = ImGui::GetIO();
-    const bool is_open = menu_open;
+    // The menu or the quit prompt takes the input (ImGui gets it, the game does not).
+    const bool is_open = menu_open || quit_prompt;
     switch (event.type) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        if (down && !event.key.repeat &&
-            (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
-            SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
+        if (down && !event.key.repeat && event.key.key == SDLK_INSERT) {
+            SetQuitPrompt(false);
+            SetOpen(!menu_open);
+            return true;
+        }
+        // Escape: closes the menu; otherwise asks whether to quit (Escape again cancels). Escape
+        // is never a game button (runtime_pad.c drops it from the bindings).
+        if (event.key.key == SDLK_ESCAPE) {
+            if (down && !event.key.repeat) {
+                if (menu_open) {
+                    SetOpen(false);
+                } else if (!quitting) {
+                    SetQuitPrompt(!quit_prompt);
+                }
+            }
             return true;
         }
         if (!is_open) {
@@ -829,7 +907,8 @@ bool HandleEvent(const SDL_Event& event) {
             r3_down = down;
         }
         if (down && l3_down && r3_down) {
-            SetOpen(!is_open);
+            SetQuitPrompt(false);
+            SetOpen(!menu_open);
             return true;
         }
         if (!is_open) {
@@ -884,7 +963,8 @@ bool HandleEvent(const SDL_Event& event) {
 
 bool Visible() {
     return initialized &&
-           (menu_open || text_entry_active || BbSettings::Get().show_fps || toast_busy);
+           (menu_open || quit_prompt || text_entry_active || BbSettings::Get().show_fps ||
+            toast_busy);
 }
 
 void NotifyTrophy(int grade, std::string game, std::string name, std::vector<unsigned char> png) {
@@ -896,7 +976,7 @@ void NotifyTrophy(int grade, std::string game, std::string name, std::vector<uns
 }
 
 bool CapturesInput() {
-    return menu_open || text_entry_active;
+    return menu_open || quit_prompt || text_entry_active;
 }
 
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text) {
@@ -964,6 +1044,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (text_entry_active) {
         TextEntryBox();
+    }
+    if (quit_prompt && !menu_open) {
+        QuitPrompt();
     }
     TrophyToast();
     ImGui::Render();

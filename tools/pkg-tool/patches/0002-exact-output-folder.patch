@@ -1,0 +1,39 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+bb: "ps4-pkg-tool --exact <pkg> <output>" extracts into <output> itself, never into <output>/<title id>
+(the launcher applies an update to a game folder of any name).
+
+--- a/src/cli/main.cpp
++++ b/src/cli/main.cpp
+@@ -5,6 +5,10 @@
+ #include <vector>
+ #include "pkg_tool/lib.h"
+ 
++// --exact: extract into the output folder itself, never into <output>/<title id> (an update goes into a
++// game folder of any name).
++static bool g_exact_out = false;
++
+ static bool ProcessPkg(const std::filesystem::path& pkgPath, const std::filesystem::path& baseOutDir) {
+     std::cout << "\nProcessing PKG: " << pkgPath.filename() << std::endl;
+     PkgMetadata meta;
+@@ -12,7 +16,7 @@
+         std::cerr << "Failed to open PKG: " << *err << "\n";
+         return false;
+     }
+-    std::filesystem::path actualOutDir = (baseOutDir.filename() == meta.title_id)
++    std::filesystem::path actualOutDir = (g_exact_out || baseOutDir.filename() == meta.title_id)
+                                              ? baseOutDir
+                                              : baseOutDir / meta.title_id;
+     std::cout << "Title ID: " << meta.title_id << "\n";
+@@ -35,6 +39,12 @@
+ }
+ 
+ int main(int argc, char** argv) {
++    if (argc >= 2 && std::string(argv[1]) == "--exact") {
++        g_exact_out = true;
++        argv[1] = argv[0];
++        --argc;
++        ++argv;
++    }
+     // Check for directory mode flag
+     if (argc >= 3 && std::string(argv[1]) == "--dir") {
+         std::filesystem::path sourceDir = argv[2];
