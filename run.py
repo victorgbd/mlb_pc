@@ -188,6 +188,9 @@ def main():
     env.setdefault('BB_READBACK_SMALL_BUFFERS', '1')
     env.setdefault('BB_READBACK_SMALL_GATE', '1')
     env.setdefault('BB_READBACK_SMALL_MAX', '4096')
+    # MLB fills its skin tone palette (256x512) on the GPU and reads it on the CPU: the skin of
+    # players without a face scan was black while the palette stayed on the GPU.
+    env.setdefault('BB_READBACK_TARGETS', '256x512')
     loadexec = out_root / 'loadexec.txt'
     env['BB_LOADEXEC_FILE'] = str(loadexec)
     guest_argv = None

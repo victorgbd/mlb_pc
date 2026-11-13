@@ -738,6 +738,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         std::scoped_lock lock{free_mutex};
         return free_queue.empty();
     };
+    const u32 wanted = generated;
     if (generated && behind()) {
         generated = 0;
     }
@@ -764,6 +765,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
     if (shown && !behind()) {
         wait_until(start + step * shown);
+    }
+    if (wanted) {
+        BbOverlay::NoteGenerated(shown, wanted - shown);
     }
     if (!PresentImage(frame, frame->image, true)) {
         free_frame();

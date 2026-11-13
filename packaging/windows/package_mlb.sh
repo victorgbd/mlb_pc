@@ -8,6 +8,8 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 source ./msys2-env.sh
 [[ -f out/bb-probe.exe && -f out/bb-gpu-capabilities.exe && -f out/bb-play.exe ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+# The launcher's PKG installer (Game page -> Install from PKG).
+[[ -f out/ps4-pkg-tool.exe ]] || bash tools/pkg-tool/build_pkg_tool.sh
 
 name='MLB The Show 24'
 package=mlb-windows
@@ -30,7 +32,7 @@ out/pyenv/Scripts/python.exe -m pip install -q --disable-pip-version-check pyins
 hidden=()
 for module in argparse base64 collections hashlib json re shutil struct tempfile zlib ctypes.wintypes \
               prepare trophies mlb_art mlb_i18n i18n_base i18n_extra lang_table lang_table_more widgets \
-              steam_shortcuts PIL.ImageTk; do
+              steam_shortcuts pkg_install PIL.ImageTk; do
     hidden+=(--hidden-import "$module")
 done
 out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN --windowed \
@@ -58,12 +60,15 @@ ldd "$dest/bin/bb-probe.exe" "$dest/bin/bb-gpu-capabilities.exe" |
     awk '/\/clang64\/bin\// {print $3}' | sort -u | while read -r dll; do
         cp -u "$dll" "$dest/bin/"
     done
+# Static: needs only Windows' own DLLs.
+cp out/ps4-pkg-tool.exe "$dest/bin/"
 # Only what run.py runs to prepare the game.
 cp scripts/prepare.py scripts/link_modules.py scripts/link_libc.py scripts/content_profile.py scripts/trophies.py "$dest/scripts/"
 cp run.py LICENSE "$dest/"
 cp packaging/windows/README-MLB.txt "$dest/README.txt"
 mkdir -p "$dest/licenses"
 cp packaging/windows/licenses/*.txt "$dest/licenses/" 2>/dev/null || true
+cp tools/pkg-tool/NOTICE.txt "$dest/licenses/ps4-pkg-tool-NOTICE.txt"
 for license in out/pyenv/Lib/site-packages/tkinterdnd2-*.dist-info/licenses/LICENSE; do
     [[ -f $license ]] && cp "$license" "$dest/licenses/tkinterdnd2-LICENSE.txt"
 done

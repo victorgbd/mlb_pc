@@ -123,6 +123,106 @@ bool TextureCache::TinyReadback(const Image& image) {
            (!image.info.props.is_tiled || (size.width == 1 && size.height == 1));
 }
 
+// bbport: MLB The Show 24 fills its skin tone palette ("SkinTonePalette2016", RGBA8 256x512,
+// 1D thin tiled) with a compute shader and then copies the texture's memory into a table its
+// CPU code looks colours up in: the skin tone of every player without a face scan (Evan Carter,
+// Josh H. Smith). GPU-written images stay on the GPU here, so the table was all zeros and those
+// faces were tinted black (target tone 0 in pixel shader c65e272e), in games and on player
+// cards. BB_READBACK_TARGETS=WxH[,WxH...] (run.py sets 256x512): images of these sizes that a
+// shader writes (storage images, render targets) are copied back to guest memory at the next
+// end-of-pipe event or submission, linear ones as they are and 1D thin tiled ones re-tiled
+// (RetileMicro).
+namespace {
+/// Whether DownloadImageMemory can write the image's tiling: linear, or 1D thin micro tiles of
+/// a single-sample uncompressed 2D image.
+bool CanDownloadTiled(const ImageInfo& info) {
+    if (!info.IsTiled()) {
+        return true;
+    }
+    const auto micro = AmdGpu::GetMicroTileMode(info.tile_mode);
+    return AmdGpu::GetArrayMode(info.tile_mode) == AmdGpu::ArrayMode::Array1DTiledThin1 &&
+           (micro == AmdGpu::MicroTileMode::Thin || micro == AmdGpu::MicroTileMode::Display) &&
+           !info.props.is_block && !info.props.is_depth && info.num_samples == 1 &&
+           info.size.depth == 1 && info.resources.layers == 1 && info.pitch % 8 == 0 &&
+           (info.num_bits == 8 || info.num_bits == 16 || info.num_bits == 32 ||
+            info.num_bits == 64);
+}
+
+/// Linear pixels (rows of `pitch`) to 1D thin micro tiles: 8x8 pixel tiles row by row, the
+/// pixels of a tile in the order of host_shaders/tiling.comp (ComputePixelIndexWithinMicroTile).
+std::vector<u8> RetileMicro(const ImageInfo& info, const u8* linear) {
+    const u32 bytes = info.num_bits / 8;
+    const u32 pitch = info.pitch;
+    const u32 height = info.size.height;
+    const u32 tiles_per_row = pitch / 8;
+    const bool display =
+        AmdGpu::GetMicroTileMode(info.tile_mode) == AmdGpu::MicroTileMode::Display;
+    std::vector<u8> tiled(size_t(tiles_per_row) * ((height + 7) / 8) * 64 * bytes);
+    for (u32 y = 0; y < height; ++y) {
+        const u32 y0 = y & 1, y1 = (y >> 1) & 1, y2 = (y >> 2) & 1;
+        for (u32 x = 0; x < pitch; ++x) {
+            const u32 x0 = x & 1, x1 = (x >> 1) & 1, x2 = (x >> 2) & 1;
+            u32 index;
+            if (!display) {
+                index = x0 | y0 << 1 | x1 << 2 | y1 << 3 | x2 << 4 | y2 << 5;
+            } else if (bytes == 1) {
+                index = x0 | x1 << 1 | x2 << 2 | y1 << 3 | y0 << 4 | y2 << 5;
+            } else if (bytes == 2) {
+                index = x0 | x1 << 1 | x2 << 2 | y0 << 3 | y1 << 4 | y2 << 5;
+            } else if (bytes == 4) {
+                index = x0 | x1 << 1 | y0 << 2 | x2 << 3 | y1 << 4 | y2 << 5;
+            } else {
+                index = x0 | y0 << 1 | x1 << 2 | x2 << 3 | y1 << 4 | y2 << 5;
+            }
+            const size_t tile = size_t(y / 8) * tiles_per_row + x / 8;
+            std::memcpy(tiled.data() + (tile * 64 + index) * bytes,
+                        linear + (size_t(y) * pitch + x) * bytes, bytes);
+        }
+    }
+    return tiled;
+}
+} // namespace
+
+bool TextureCache::ReadbackTarget(const Image& image) {
+    static const std::vector<std::pair<u32, u32>> sizes = [] {
+        std::vector<std::pair<u32, u32>> list;
+        const char* env = std::getenv("BB_READBACK_TARGETS");
+        while (env && *env) {
+            char* end = nullptr;
+            const u32 width = std::strtoul(env, &end, 10);
+            if (end == env || *end != 'x') {
+                break;
+            }
+            env = end + 1;
+            const u32 height = std::strtoul(env, &end, 10);
+            if (end == env) {
+                break;
+            }
+            list.emplace_back(width, height);
+            env = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    if (sizes.empty() || image.info.guest_address == 0 || image.info.size.depth != 1) {
+        return false;
+    }
+    const std::pair<u32, u32> size{image.info.size.width, image.info.size.height};
+    if (std::ranges::find(sizes, size) == sizes.end()) {
+        return false;
+    }
+    static std::atomic<u32> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 12) {
+        std::printf("Texture cache: GPU-written %ux%u %s at 0x%llx (%s, %u mips) %s\n",
+                    size.first, size.second, vk::to_string(image.info.pixel_format).c_str(),
+                    static_cast<unsigned long long>(image.info.guest_address),
+                    std::string{AmdGpu::NameOf(image.info.tile_mode)}.c_str(),
+                    image.info.resources.levels,
+                    CanDownloadTiled(image.info) ? "is read back to guest memory"
+                                                 : "is not read back (BB_READBACK_TARGETS)");
+    }
+    return CanDownloadTiled(image.info);
+}
+
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
@@ -152,8 +252,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download.mapped, download_size);
+        if (image.info.IsTiled() && CanDownloadTiled(image.info)) {
+            // bbport: micro-tiled guest memory (ReadbackTarget): the guest detiles what it reads.
+            const std::vector<u8> tiled = RetileMicro(image.info, download.mapped);
+            Core::Memory::Instance()->TryWriteBacking(
+                std::bit_cast<u8*>(image.info.guest_address), tiled.data(),
+                std::min<size_t>(tiled.size(), image.info.guest_size));
+        } else {
+            Core::Memory::Instance()->TryWriteBacking(
+                std::bit_cast<u8*>(image.info.guest_address), download.mapped, download_size);
+        }
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
@@ -348,6 +456,26 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
+        // bbport: and the reverse, an uncompressed image where a compressed one is cached (one
+        // texel per block: R32G32 over BC1, R32G32B32A32 over BC7). MLB The Show 24 compresses
+        // player faces on the GPU by writing such an image, at addresses it reuses: when the
+        // BC1 texture of an earlier face was still cached there, the write went through an
+        // R32G32Uint view of the compressed image (not a valid view: the image is not created
+        // for block texel views) and the face came out as noise (coloured beards, black or
+        // see-through faces, different players in each session). The image is re-made
+        // uncompressed, as the compressed one is re-made when it is sampled again.
+        if (!image_info.props.is_block && cache_image.info.props.is_block) {
+            static std::atomic<u32> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 30) {
+                std::printf("Texture cache: %ux%u %s at 0x%llx re-made as %ux%u %s\n",
+                            cache_image.info.size.width, cache_image.info.size.height,
+                            vk::to_string(cache_image.info.pixel_format).c_str(),
+                            static_cast<unsigned long long>(cache_image.info.guest_address),
+                            image_info.size.width, image_info.size.height,
+                            vk::to_string(image_info.pixel_format).c_str());
+            }
+            return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
 
         if (image_info.guest_size == cache_image.info.guest_size &&
             (image_info.type == AmdGpu::ImageType::Color3D ||
@@ -362,6 +490,38 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             image_info.pitch == cache_image.info.pitch && image_info.resources.levels == 1 &&
             cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
             cache_image.info.resources.layers == 1;
+
+        // bbport: a GPU-written image asked for again with more mips in another format of its
+        // class. MLB The Show 24 draws its composed textures (player faces, the hair colour map
+        // the strands take their colours from, uniforms) into an R8G8B8A8Srgb target with one
+        // mip, then reads the same memory as an R8G8B8A8Unorm texture with the whole mip chain
+        // (to fill the mips and compress it). The rule below took the cached image as a view
+        // because the formats differ, FindImage found it short of mips and replaced it with a
+        // new image uploaded from guest memory: what had been drawn was lost ("Image overlap
+        // resolve failed"), the first time at each address and again after every eviction. The
+        // strands of the players built then took their colours from whatever the memory held
+        // (hair and beards with strands of every colour). The image is expanded, keeping what
+        // was drawn.
+        if (!merged_image_id && image_info.pixel_format != cache_image.info.pixel_format &&
+            True(cache_image.flags & ImageFlagBits::GpuModified) &&
+            image_info.type == cache_image.info.type && image_info.size == cache_image.info.size &&
+            image_info.num_samples == cache_image.info.num_samples &&
+            image_info.guest_size > cache_image.info.guest_size &&
+            image_info.resources > cache_image.info.resources &&
+            IsVulkanFormatCompatible(cache_image.info.pixel_format, image_info.pixel_format)) {
+            static std::atomic<u32> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 30) {
+                std::printf("Texture cache: GPU-written %ux%u %s at 0x%llx (%u mips) expanded to "
+                            "%s with %u mips\n",
+                            cache_image.info.size.width, cache_image.info.size.height,
+                            vk::to_string(cache_image.info.pixel_format).c_str(),
+                            static_cast<unsigned long long>(cache_image.info.guest_address),
+                            cache_image.info.resources.levels,
+                            vk::to_string(image_info.pixel_format).c_str(),
+                            image_info.resources.levels);
+            }
+            return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
 
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
@@ -791,6 +951,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
+        } else if (ReadbackTarget(image)) {
+            std::unique_lock lk{download_images_mutex};
+            download_images.emplace(image_id);
         } else if (TinyReadback(image)) {
             std::unique_lock lk{download_images_mutex};
             tiny_download_images.emplace(image_id);
@@ -819,6 +982,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+        std::unique_lock lk{download_images_mutex};
+        download_images.emplace(image_id);
+    } else if (ReadbackTarget(image)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     } else if (TinyReadback(image)) {

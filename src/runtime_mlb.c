@@ -5,7 +5,7 @@
  * play, live streaming) report "not available" in the way the game is prepared for; the rest
  * work: JSON parsing (libSceJson2), random numbers, temporary data, PNG headers.
  * Audio3d: the game's 3D audio port runs, and its AudioOut ports (the mixed output) play through
- * runtime_audio.c; sound objects pushed into the 3D port are not rendered yet.
+ * runtime_audio.c; the objects (MLB's songs) are mixed to stereo without their positions.
  * Every function is logged the first time it is called, so a log shows which ones the game uses. */
 #define _GNU_SOURCE
 #include "runtime.h"
@@ -286,12 +286,13 @@ typedef struct { uint64_t size; uint32_t granularity, rate, max_objects, queue_d
 static struct { int used; uint32_t granularity, queue_depth; uint64_t next_push_ns; } audio3d_ports[AUDIO3D_PORTS];
 static atomic_uint audio3d_next_object=1;
 static pthread_mutex_t audio3d_lock=PTHREAD_MUTEX_INITIALIZER;
+static void audio3d_mixer_reset(int port);
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
 static ABI int32_t audio3d_initialize(int64_t reserved) {
     (void)reserved;
     int32_t (ABI *init)(void)=runtime_audio_function("sceAudioOutInit");
     if (init) init();
-    ONCE("Audio3d initialized (3D objects are not rendered; AudioOut ports play)");
+    ONCE("Audio3d initialized (objects mixed to stereo without positions; AudioOut ports play)");
     return 0;
 }
 static ABI int32_t audio3d_terminate(void) { return 0; }
@@ -307,6 +308,7 @@ static ABI int32_t audio3d_port_open(int32_t user, const Audio3dOpen *open, uint
         audio3d_ports[id].queue_depth=open->queue_depth ? open->queue_depth : 2;
         audio3d_ports[id].next_push_ns=0;
     }
+    if (id>=0) audio3d_mixer_reset(id);
     pthread_mutex_unlock(&audio3d_lock);
     if (id<0) return (int32_t)0x80EA0006;
     *port=(uint32_t)id;
@@ -331,10 +333,202 @@ static ABI int32_t audio3d_object_reserve(uint32_t port, uint32_t *object) {
     *object=atomic_fetch_add(&audio3d_next_object,1); return 0;
 }
 static ABI int32_t audio3d_port_ok(uint32_t port) { return audio3d_valid(port) ? 0 : AUDIO3D_INVALID_PORT; }
-/* Push with blocking: one granule of audio time per push, like the hardware queue drains. */
+/* Objects: MLB The Show 24 plays its licensed songs (and other streams) as Audio3d objects with
+ * a PCM buffer, a gain and a passthrough attribute (one mono object per speaker), not through its
+ * AudioOut mix; with the objects dropped every song was silent. Each port mixes its objects'
+ * buffers into a stereo granule (passthrough left/right to that side, others to both at -3 dB),
+ * sceAudio3dPortAdvance closes the granule and sceAudio3dPortPush plays it through an AudioOut
+ * port of its own (2 ch float), which also paces a blocking push. Positions are not rendered.
+ * BB_AUDIO3D_OBJECTS=0: dropped as before. BB_AUDIO_TRACE=1: what the objects carry, every 5 s. */
+typedef struct { uint32_t id, pad; const void *value; uint64_t size; } Audio3dAttribute;
+typedef struct { uint32_t format, pad; const void *samples; uint32_t count; } Audio3dPcm;
+#define AUDIO3D_OBJECTS 64
+#define AUDIO3D_MAX_GRANULE 2048
+#define AUDIO3D_QUEUE 8
+typedef struct { uint32_t id; float gain; uint32_t passthrough; } Audio3dObject;
+typedef struct Audio3dMixerTag {
+    Audio3dObject objects[AUDIO3D_OBJECTS];
+    int nobjects;
+    float mix[AUDIO3D_MAX_GRANULE*2];               /* the granule being filled, interleaved L R */
+    float queue[AUDIO3D_QUEUE][AUDIO3D_MAX_GRANULE*2]; /* closed granules waiting for a push */
+    int queue_head, queue_count;
+    int32_t out_handle;                              /* AudioOut port, 0 before the first push */
+    pthread_mutex_t lock;
+} Audio3dMixer;
+static Audio3dMixer audio3d_mixers[AUDIO3D_PORTS];
+/* At port open (under audio3d_lock): empty mixer; the AudioOut port of a reopened port is kept. */
+static void audio3d_mixer_reset(int port) {
+    static int locks_ready;
+    if (!locks_ready) { for (int i=0;i<AUDIO3D_PORTS;++i) pthread_mutex_init(&audio3d_mixers[i].lock,NULL); locks_ready=1; }
+    Audio3dMixer *m=&audio3d_mixers[port];
+    pthread_mutex_lock(&m->lock);
+    m->nobjects=0; m->queue_head=m->queue_count=0;
+    memset(m->mix,0,sizeof(m->mix));
+    pthread_mutex_unlock(&m->lock);
+}
+static int audio3d_objects_on(void) {
+    static int on=-1;
+    if (on<0) { const char *e=getenv("BB_AUDIO3D_OBJECTS"); on=!(e && e[0]=='0'); }
+    return on;
+}
+static int audio3d_trace_on(void) {
+    static int trace=-1;
+    if (trace<0) { const char *e=getenv("BB_AUDIO_TRACE"); trace=e && e[0]>='1'; }
+    return trace;
+}
+static Audio3dObject *audio3d_object(Audio3dMixer *m, uint32_t id) {
+    for (int i=0;i<m->nobjects;++i) if (m->objects[i].id==id) return &m->objects[i];
+    if (m->nobjects>=AUDIO3D_OBJECTS) return NULL;
+    Audio3dObject *o=&m->objects[m->nobjects++];
+    o->id=id; o->gain=1.0f; o->passthrough=0;
+    return o;
+}
+static void audio3d_trace(uint32_t object, uint32_t count, const Audio3dAttribute *attributes) {
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t calls, by_id[16], pcm_samples[2], pcm_nonzero, passthrough_values[4], last_ns;
+    static uint32_t objects_seen[64]; static int nobjects;
+    pthread_mutex_lock(&lock);
+    ++calls;
+    int seen=0;
+    for (int i=0;i<nobjects;++i) seen|=objects_seen[i]==object;
+    if (!seen && nobjects<64) objects_seen[nobjects++]=object;
+    for (uint32_t i=0;i<count;++i) {
+        const Audio3dAttribute *a=&attributes[i];
+        by_id[a->id<16 ? a->id : 0]++;
+        if (a->id==1 && a->value && a->size>=sizeof(Audio3dPcm)) {
+            const Audio3dPcm *pcm=a->value;
+            pcm_samples[pcm->format&1]+=pcm->count;
+            if (pcm->samples && pcm->count) {
+                const unsigned char *s=pcm->samples; size_t n=(size_t)pcm->count*((pcm->format&1) ? 4 : 2);
+                for (size_t k=0;k<n && k<4096;++k) if (s[k]) { ++pcm_nonzero; break; }
+            }
+        } else if (a->id==6 && a->value && a->size>=4) {
+            const uint32_t v=*(const uint32_t *)a->value;
+            passthrough_values[v<3 ? v : 3]++;
+        }
+    }
+    const uint64_t now=now_ns();
+    if (!last_ns) last_ns=now;
+    if (now-last_ns>=5000000000ull) {
+        printf("Audio trace: Audio3d objects: %llu calls, %d objects; attributes pcm %llu gain %llu passthrough %llu "
+               "(none %llu left %llu right %llu other %llu) position %llu restricted %llu; PCM samples s16 %llu float %llu, "
+               "%llu buffers with sound\n",
+               (unsigned long long)calls,nobjects,(unsigned long long)by_id[1],(unsigned long long)by_id[5],
+               (unsigned long long)by_id[6],(unsigned long long)passthrough_values[0],(unsigned long long)passthrough_values[1],
+               (unsigned long long)passthrough_values[2],(unsigned long long)passthrough_values[3],(unsigned long long)by_id[3],
+               (unsigned long long)by_id[10],(unsigned long long)pcm_samples[0],(unsigned long long)pcm_samples[1],
+               (unsigned long long)pcm_nonzero);
+        calls=0; memset(by_id,0,sizeof(by_id)); memset(passthrough_values,0,sizeof(passthrough_values));
+        pcm_samples[0]=pcm_samples[1]=0; pcm_nonzero=0; last_ns=now;
+    }
+    pthread_mutex_unlock(&lock);
+}
+static ABI int32_t audio3d_object_attributes(uint32_t port, uint32_t object, uint32_t count, const Audio3dAttribute *attributes) {
+    if (!audio3d_valid(port)) return AUDIO3D_INVALID_PORT;
+    if (count && !attributes) return AUDIO3D_INVALID_PARAMETER;
+    if (audio3d_trace_on()) audio3d_trace(object,count,attributes);
+    if (!audio3d_objects_on()) return 0;
+    Audio3dMixer *m=&audio3d_mixers[port];
+    const uint32_t granule=audio3d_ports[port].granularity<=AUDIO3D_MAX_GRANULE ? audio3d_ports[port].granularity : AUDIO3D_MAX_GRANULE;
+    pthread_mutex_lock(&m->lock);
+    Audio3dObject *o=audio3d_object(m,object);
+    if (o) {
+        /* Gain and passthrough first: they apply to the buffer given in the same call. */
+        for (uint32_t i=0;i<count;++i) {
+            const Audio3dAttribute *a=&attributes[i];
+            if (a->id==5 && a->value && a->size>=4) {
+                float g; memcpy(&g,a->value,4);
+                if (g==g && g>=0.0f && g<=16.0f) o->gain=g;
+            } else if (a->id==6 && a->value && a->size>=4) {
+                o->passthrough=*(const uint32_t *)a->value;
+            } else if (a->id==7) {
+                o->gain=1.0f; o->passthrough=0;          /* reset state */
+            }
+        }
+        for (uint32_t i=0;i<count;++i) {
+            const Audio3dAttribute *a=&attributes[i];
+            if (a->id!=1 || !a->value || a->size<sizeof(Audio3dPcm)) continue;
+            const Audio3dPcm *pcm=a->value;
+            if (!pcm->samples || !pcm->count) continue;
+            const uint32_t n=pcm->count<granule ? pcm->count : granule;
+            const float left=o->passthrough==2 ? 0.0f : o->passthrough==1 ? o->gain : o->gain*0.7071f;
+            const float right=o->passthrough==1 ? 0.0f : o->passthrough==2 ? o->gain : o->gain*0.7071f;
+            for (uint32_t s=0;s<n;++s) {
+                float v;
+                if (pcm->format&1) memcpy(&v,(const char *)pcm->samples+(size_t)s*4,4);
+                else { int16_t w; memcpy(&w,(const char *)pcm->samples+(size_t)s*2,2); v=(float)w/32768.0f; }
+                if (v!=v) continue;
+                m->mix[s*2]+=v*left;
+                m->mix[s*2+1]+=v*right;
+            }
+        }
+    }
+    pthread_mutex_unlock(&m->lock);
+    return 0;
+}
+static ABI int32_t audio3d_object_unreserve(uint32_t port, uint32_t object) {
+    if (!audio3d_valid(port)) return AUDIO3D_INVALID_PORT;
+    Audio3dMixer *m=&audio3d_mixers[port];
+    pthread_mutex_lock(&m->lock);
+    for (int i=0;i<m->nobjects;++i) if (m->objects[i].id==object) { m->objects[i]=m->objects[--m->nobjects]; break; }
+    pthread_mutex_unlock(&m->lock);
+    return 0;
+}
+/* The end of a granule: the mixed buffer joins the queue the pushes play. */
+static ABI int32_t audio3d_port_advance(uint32_t port) {
+    if (!audio3d_valid(port)) return AUDIO3D_INVALID_PORT;
+    if (!audio3d_objects_on()) return 0;
+    Audio3dMixer *m=&audio3d_mixers[port];
+    const uint32_t granule=audio3d_ports[port].granularity<=AUDIO3D_MAX_GRANULE ? audio3d_ports[port].granularity : AUDIO3D_MAX_GRANULE;
+    pthread_mutex_lock(&m->lock);
+    if (m->queue_count==AUDIO3D_QUEUE) {             /* nobody pushes: drop the oldest */
+        m->queue_head=(m->queue_head+1)%AUDIO3D_QUEUE; --m->queue_count;
+    }
+    float *slot=m->queue[(m->queue_head+m->queue_count)%AUDIO3D_QUEUE];
+    for (uint32_t s=0;s<granule*2;++s) {
+        const float v=m->mix[s];
+        slot[s]=v>1.0f ? 1.0f : v<-1.0f ? -1.0f : v;
+    }
+    ++m->queue_count;
+    memset(m->mix,0,sizeof(float)*granule*2);
+    pthread_mutex_unlock(&m->lock);
+    return 0;
+}
+/* Push with blocking: one granule of audio time per push, like the hardware queue drains. The
+ * objects' granule goes to the port's AudioOut port: a blocking push is paced by its output. */
 static ABI int32_t audio3d_port_push(uint32_t port, int blocking) {
     if (!audio3d_valid(port)) return AUDIO3D_INVALID_PORT;
-    uint64_t period=(uint64_t)audio3d_ports[port].granularity*1000000000u/48000u, now=now_ns();
+    Audio3dMixer *m=&audio3d_mixers[port];
+    const uint32_t granule=audio3d_ports[port].granularity;
+    if (audio3d_objects_on() && granule<=AUDIO3D_MAX_GRANULE && !(granule & 0xff)) {
+        static float silence[AUDIO3D_MAX_GRANULE*2];
+        float buffer[AUDIO3D_MAX_GRANULE*2];
+        const float *data=silence;
+        pthread_mutex_lock(&m->lock);
+        if (!m->out_handle) {
+            int32_t (ABI *open)(int32_t,int32_t,int32_t,uint32_t,uint32_t,uint32_t)=runtime_audio_function("sceAudioOutOpen");
+            const int32_t handle=open ? open(255,0,0,granule,48000,4) : -1;  /* main, 2 ch float */
+            m->out_handle=handle>0 ? handle : -1;
+            if (handle>0) printf("Runtime: Audio3d port %u plays its objects (stereo)\n",port);
+        }
+        if (m->queue_count) {
+            memcpy(buffer,m->queue[m->queue_head],sizeof(float)*granule*2);
+            m->queue_head=(m->queue_head+1)%AUDIO3D_QUEUE; --m->queue_count;
+            data=buffer;
+        }
+        const int32_t handle=m->out_handle;
+        pthread_mutex_unlock(&m->lock);
+        if (handle>0) {
+            if (blocking) {
+                int32_t (ABI *output)(int32_t,const void *)=runtime_audio_function("sceAudioOutOutput");
+                if (output) { output(handle,data); audio3d_ports[port].next_push_ns=0; return 0; }
+            } else {
+                int32_t (ABI *queue)(int32_t,const void *)=runtime_audio_function("bbAudioOutQueue");
+                if (queue) queue(handle,data);
+            }
+        }
+    }
+    uint64_t period=(uint64_t)granule*1000000000u/48000u, now=now_ns();
     uint64_t *next=&audio3d_ports[port].next_push_ns;
     if (*next<now || *next>now+period*8) *next=now;
     if (blocking && *next>now) { struct timespec t={0,(long)(*next-now)}; nanosleep(&t,NULL); }
@@ -512,10 +706,10 @@ static const RuntimeExport exports[]={
     {"sceAudio3dInitialize",audio3d_initialize}, {"sceAudio3dTerminate",audio3d_terminate},
     {"sceAudio3dPortOpen",audio3d_port_open}, {"sceAudio3dPortClose",audio3d_port_close},
     {"sceAudio3dPortGetAttributesSupported",audio3d_port_attributes}, {"sceAudio3dPortSetAttribute",audio3d_port_ok},
-    {"sceAudio3dPortAdvance",audio3d_port_ok}, {"sceAudio3dPortPush",audio3d_port_push},
+    {"sceAudio3dPortAdvance",audio3d_port_advance}, {"sceAudio3dPortPush",audio3d_port_push},
     {"sceAudio3dPortGetQueueLevel",audio3d_queue_level},
-    {"sceAudio3dObjectReserve",audio3d_object_reserve}, {"sceAudio3dObjectUnreserve",audio3d_port_ok},
-    {"sceAudio3dObjectSetAttributes",audio3d_port_ok},
+    {"sceAudio3dObjectReserve",audio3d_object_reserve}, {"sceAudio3dObjectUnreserve",audio3d_object_unreserve},
+    {"sceAudio3dObjectSetAttributes",audio3d_object_attributes},
     {"sceAudio3dAudioOutOpen",audio3d_out_open}, {"sceAudio3dAudioOutClose",audio3d_out_close},
     {"sceAudio3dAudioOutOutputs",audio3d_out_outputs},
     /* AudioOut, Ajm */

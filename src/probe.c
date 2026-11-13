@@ -37,6 +37,7 @@ typedef struct { uint64_t target, kind, value, addend; } Reloc;
 static char (*names)[128];
 static uint64_t import_count;
 static unsigned char *image;
+static uint64_t guest_image_size;
 static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
 static LinkedModule modules[16];
@@ -392,9 +393,71 @@ static int emulate_movbe(CONTEXT *c) {
     InterlockedIncrement64(&movbe_emulated);
     return 1;
 }
+/* BB_WATCH_WRITE=address (hex, 4-byte aligned; diagnosis): a hardware watchpoint on four bytes of
+ * guest memory. Every write to them prints the guest code offset after the writing instruction,
+ * the 16 bytes there as floats and the code addresses found on the stack (the first 60 hits).
+ * BB_WATCH_WRITE_LEN=8 watches eight bytes (8-byte aligned). */
+#include <tlhelp32.h>
+static uintptr_t watch_write_address;
+static volatile LONG watch_write_hits;
+static DWORD WINAPI watch_write_thread(void *argument) {
+    (void)argument;
+    static DWORD armed[4096]; int count=0;
+    const char *len=getenv("BB_WATCH_WRITE_LEN");
+    const DWORD64 control=UINT64_C(1)|(UINT64_C(1)<<16)|((len && len[0]=='8' ? UINT64_C(2) : UINT64_C(3))<<18);
+    const DWORD self=GetCurrentThreadId(), process=GetCurrentProcessId();
+    printf("Watch: writes to 0x%" PRIxPTR "\n",watch_write_address);
+    for (;;) {
+        HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        THREADENTRY32 entry={.dwSize=sizeof(entry)};
+        if (snapshot!=INVALID_HANDLE_VALUE && Thread32First(snapshot,&entry)) do {
+            if (entry.th32OwnerProcessID!=process || entry.th32ThreadID==self) continue;
+            int known=0;
+            for (int i=0;i<count && !known;++i) known=armed[i]==entry.th32ThreadID;
+            if (known || count>=4096) continue;
+            HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_SET_CONTEXT,FALSE,entry.th32ThreadID);
+            if (!thread) continue;
+            if (SuspendThread(thread)!=(DWORD)-1) {
+                CONTEXT c; memset(&c,0,sizeof(c)); c.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+                if (GetThreadContext(thread,&c)) {
+                    c.Dr0=watch_write_address; c.Dr6=0; c.Dr7=control; c.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+                    if (SetThreadContext(thread,&c)) armed[count++]=entry.th32ThreadID;
+                }
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+        } while (Thread32Next(snapshot,&entry));
+        if (snapshot!=INVALID_HANDLE_VALUE) CloseHandle(snapshot);
+        Sleep(100);
+    }
+    return 0;
+}
+static int watch_write_hit(CONTEXT *c) {
+    if (!watch_write_address || !(c->Dr6&1)) return 0;
+    c->Dr6=0;
+    const LONG hit=InterlockedIncrement(&watch_write_hits);
+    if (hit>60) return 1;
+    const uintptr_t base=(uintptr_t)image, size=(uintptr_t)(guest_image_size ? guest_image_size : 0x20000000);
+    const float *f=(const float *)(watch_write_address&~(uintptr_t)15);
+    char line[1024]; int n=snprintf(line,sizeof(line),"Watch: write %ld by ",(long)hit);
+    if (c->Rip-base<size) n+=snprintf(line+n,sizeof(line)-n,"guest+0x%llx",(unsigned long long)(c->Rip-base));
+    else n+=snprintf(line+n,sizeof(line)-n,"host %p",(void *)c->Rip);
+    n+=snprintf(line+n,sizeof(line)-n," thread %lu: %g %g %g %g; rsi %llx rdi %llx; stack:",(unsigned long)GetCurrentThreadId(),
+                f[0],f[1],f[2],f[3],(unsigned long long)c->Rsi,(unsigned long long)c->Rdi);
+    const uint64_t *stack=(const uint64_t *)c->Rsp; int found=0;
+    for (int i=0;i<400 && found<10;++i) {
+        MEMORY_BASIC_INFORMATION info;
+        if ((i&63)==0 && (!VirtualQuery(stack+i,&info,sizeof(info)) || info.State!=MEM_COMMIT || (info.Protect&(PAGE_NOACCESS|PAGE_GUARD)))) break;
+        const uint64_t v=stack[i];
+        if (v-base<size && v-base>0x1000) { n+=snprintf(line+n,sizeof(line)-n," +0x%llx",(unsigned long long)(v-base)); ++found; }
+    }
+    puts(line); fflush(stdout);
+    return 1;
+}
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    if (code==EXCEPTION_SINGLE_STEP && watch_write_hit(info->ContextRecord)) return EXCEPTION_CONTINUE_EXECUTION;
     /* Instructions this CPU lacks (cpu_patch.c): a rewritten breakpoint (Rip at the int3) or one
      * the scan missed continue in a thunk. */
     if (code==EXCEPTION_BREAKPOINT || code==EXCEPTION_ILLEGAL_INSTRUCTION) {
@@ -629,7 +692,7 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
 typedef struct { volatile uint64_t calls, rdi, rsi, rdx, rcx, r8, r15; uint64_t offset, printed; } GuestHook;
 static GuestHook *guest_hooks;
 static size_t guest_hook_count;
-static uint64_t guest_image_size;
+
 /* A pointer argument into the image (or guest memory the tracker knows) shown as text. */
 static void print_hook_string(const char *name, uint64_t value) {
     const unsigned char *p=(const unsigned char *)(uintptr_t)value;
@@ -1686,6 +1749,10 @@ int main(int argc, char **argv) {
     entered_game=1;
 #ifdef _WIN32
     if (getenv("BB_WATCH")) CloseHandle(CreateThread(NULL,0,watch_thread,getenv("BB_WATCH"),0,NULL));
+    if (getenv("BB_WATCH_WRITE")) {
+        watch_write_address=(uintptr_t)strtoull(getenv("BB_WATCH_WRITE"),NULL,16);
+        if (watch_write_address) CloseHandle(CreateThread(NULL,0,watch_write_thread,NULL,0,NULL));
+    }
 #endif
     /* argv: the executable and, after sceSystemServiceLoadExec, the arguments it was given
      * (--guest-argv: one per line, the guest path first). The caller's list is argv as is, its

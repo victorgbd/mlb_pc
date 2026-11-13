@@ -11,7 +11,8 @@ Disclaimer
   partners. "MLB The Show" and "MLB" are trademarks of their owners, named here only to say
   which game this port works with.
 - No game files are included. Use your own legally obtained copy of the game; this package does
-  not provide game files, decryption keys or tools that bypass copy protection.
+  not provide game files, decryption keys or tools that bypass copy protection. The PKG
+  installer opens fake PKGs only (made from your own copy), never retail PKGs.
 - Provided as is, without any warranty (see LICENSE).
 - Proyecto no oficial, sin relacion con Sony, San Diego Studio, MLB ni la MLBPA. No incluye
   archivos del juego: necesitas tu propia copia legal.
@@ -25,6 +26,11 @@ Requirements
 Starting
 - "MLB The Show 24.exe" opens the launcher. On the Game page choose your game folder, then
   press PLAY (or double-click the cover on the Play page).
+- Only have the game as a PKG file? Game page -> "Install from PKG...": choose the game PKG
+  (and its update PKG, if you have one; select both), then the folder to install into. The
+  launcher unpacks it into a CUSA43942 folder there and sets it as the game folder. Needs
+  about as much free space as the PKG files take. An update PKG chosen alone is unpacked over
+  the game folder already set. DLC PKGs are not supported.
 - The first start prepares the game (a minute) and compiles shaders: the first menus and the
   first game stutter for a while. Later starts use the shader cache.
 - "Play MLB The Show 24.exe" starts the game straight away with the settings saved in the
@@ -40,8 +46,9 @@ Options
   speakers (stereo, 5.1, 7.1).
 - Controls page: keyboard and controller work together, all remappable.
   Keyboard defaults: Space Cross, C Circle, F Square, E Triangle, Q/G L1/R1, Z/X L2/R2,
-  Left Shift/V L3/R3, WASD left stick, IJKL right stick, arrows d-pad, Escape/Enter Options,
-  Tab touchpad. Insert opens the in-game settings menu. Bindings are saved in input.ini.
+  Left Shift/V L3/R3, WASD left stick, IJKL right stick, arrows d-pad, Enter Options,
+  Tab touchpad. Insert opens the in-game settings menu. Escape asks whether to quit the game
+  (Quit / Cancel; Escape again cancels). Bindings are saved in input.ini.
 - Trophies: the game's trophy list is read from sce_sys\trophy\trophy00.trp in the game folder.
   A trophy the game awards shows as a notice in the game and on the launcher's Trophies page.
 - Advanced page -> Graphics fixes: the crowd textures and the see-through nets are fixes of this
