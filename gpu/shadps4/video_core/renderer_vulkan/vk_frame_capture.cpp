@@ -77,6 +77,17 @@ bool CaptureByFlip() {
     }();
     return value || dump_requested.load(std::memory_order_acquire) || dumping;
 }
+// Flips a by-flip recording spans. The flips are counted where the game presents, ahead of the
+// GPU thread: with 2 a recording could end before the frame's later passes (MLB The Show 24's
+// player draws). BB_CAPTURE_FLIPS=N, default 4.
+u64 FlipSpan() {
+    static const u64 value = [] {
+        const char* env = std::getenv("BB_CAPTURE_FLIPS");
+        const long n = env ? std::atol(env) : 4;
+        return u64(n < 1 ? 1 : n);
+    }();
+    return value;
+}
 std::mutex display_mutex;
 std::vector<VAddr> display_buffers;
 // bbport: read on every draw; the game registers a handful of display buffers once.
@@ -367,7 +378,8 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
                 StartDump();
             }
             state.store(Recording, std::memory_order_release);
-        } else if (state.load(std::memory_order_relaxed) == Recording && now >= record_start_flip + 2) {
+        } else if (state.load(std::memory_order_relaxed) == Recording &&
+                   now >= record_start_flip + FlipSpan()) {
             Write(last_presented.load(std::memory_order_relaxed));
             EndDump();
             entries.clear();

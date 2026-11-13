@@ -407,7 +407,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     gbuffer_draw = camera_motion->Enabled() && std::popcount(key.mrt_mask) >= 5 && db_desc.first;
     if (gbuffer_draw) {
         camera_motion->OnGBufferPass(db_desc.first);
-    } else if (camera_motion->VelocityMode() && db_desc.first && !camera_motion->Depth()) {
+    } else if ((camera_motion->VelocityMode() || upscaler->SceneDepthMode()) && db_desc.first &&
+               !camera_motion->Depth()) {
         // Uncharted: no G-buffer of 5 targets. The frame's first pass at the display size that
         // is depth-only (U1's prepass) or draws RGBA16F color (U2's first scene pass) holds the
         // scene depth.
@@ -1453,6 +1454,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
          BbToggle::Disabled(BbToggle::OneFrameStart))) {
         frame_display_address = regs.color_buffers[0].Address();
         scene_started = false;
+        // bbport: frame generation's inputs before the final pass (BB_FRAME_GEN_PS), while
+        // this frame's scene depth is still known.
+        if (upscaler->Enabled()) {
+            const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            upscaler->OnFrameGenPass(fs ? fs->pgm_hash : 0);
+        }
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
@@ -1906,6 +1913,13 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
     pipeline->BindResources(set_writes, push_data);
+    // bbport: indirect draws in frame captures too (they were missing from the pass lists).
+    if (FrameCapture::Active()) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        FrameCapture::Draw(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0, 0, 0);
+        FrameCapture::Note(is_indexed ? "\n  indirect indexed draw" : "\n  indirect draw");
+    }
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
@@ -2388,8 +2402,17 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address,
                                         u32 size) {
+    FrameCapture::Poll();
     scheduler.PopPendingOperations();
     const u32 offset = 0;
+    const u64 cs_hash = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+    if (SkipShader(cs_hash)) {
+        return;
+    }
+    // bbport: indirect dispatches reach the upscaler's trigger like direct ones.
+    if (upscaler->Enabled()) {
+        upscaler->OnDispatch(cs_hash);
+    }
 
     if (!BindResources(pipeline)) {
         return;
@@ -2404,6 +2427,10 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
 
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
+    if (FrameCapture::Active()) {
+        FrameCapture::Dispatch(cs_hash, 0, 0, 0);
+        FrameCapture::Note("indirect");
+    }
 
     const vk::Pipeline handle = pipeline->Handle();
     const vk::Buffer args = buffer->Handle();

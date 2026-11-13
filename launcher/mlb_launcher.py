@@ -853,15 +853,46 @@ class Launcher:
         """The mouse wheel scrolls the page under the pointer; while a key is being bound it is the binding."""
         if getattr(self, 'capturing', None):
             return self.captured_wheel(event)
-        scroller = self.scrollers.get(self.current_page)
-        if scroller:
-            canvas, bar = scroller
-            x, y = self.root.winfo_pointerxy()
-            inside = (canvas.winfo_rootx() <= x < canvas.winfo_rootx() + canvas.winfo_width() and
-                      canvas.winfo_rooty() <= y < canvas.winfo_rooty() + canvas.winfo_height())
-            if inside and bar.winfo_ismapped():
-                canvas.yview_scroll(-1 * (event.delta // 120), 'units')
+        canvas = self.scroller_under_pointer()
+        if canvas:
+            # One notch (120) moves a tenth of the page; finer mice send smaller steps.
+            self.scroll_page(canvas, -event.delta / 120 * canvas.winfo_height() / 10)
         return 'break'
+
+    def on_touchpad(self, event):
+        """Tk 9 reports touchpads and smooth-scrolling mice as TouchpadScroll: dx in the high 16 bits, dy in the low."""
+        low = event.delta & 0xffff
+        dy = low - 0x10000 if low >= 0x8000 else low
+        if getattr(self, 'capturing', None):
+            if dy:
+                self.set_key(*self.capturing, 'Wheel Up' if dy > 0 else 'Wheel Down')
+            return 'break'
+        canvas = self.scroller_under_pointer()
+        if canvas and dy:
+            self.scroll_page(canvas, -dy * self.dpi)
+        return 'break'
+
+    def scroller_under_pointer(self):
+        """The current page's canvas when the pointer is over it and it has something to scroll."""
+        scroller = self.scrollers.get(self.current_page)
+        if not scroller:
+            return None
+        canvas, bar = scroller
+        x, y = self.root.winfo_pointerxy()
+        inside = (canvas.winfo_rootx() <= x < canvas.winfo_rootx() + canvas.winfo_width() and
+                  canvas.winfo_rooty() <= y < canvas.winfo_rooty() + canvas.winfo_height())
+        return canvas if inside and bar.winfo_ismapped() else None
+
+    def scroll_page(self, canvas, pixels):
+        """Scrolls by pixels, carrying the fractions over so slow, fine scrolling still moves."""
+        self.wheel_rest = getattr(self, 'wheel_rest', 0.0) + pixels
+        step = int(self.wheel_rest)
+        self.wheel_rest -= step
+        if step:
+            try:
+                canvas.yview_scroll(step, 'pixels')
+            except self.tk.TclError:  # Tk 8.6 canvases only know units (a tenth of the page)
+                canvas.yview_moveto(canvas.yview()[0] + step / max(1, float(canvas.cget('scrollregion').split()[3])))
 
     # ---- layout ------------------------------------------------------------------------------
     def build(self):
@@ -945,6 +976,11 @@ class Launcher:
         self.pages, self.scrollers, self.page_cards = {}, {}, {}
         self.root.bind_all('<MouseWheel>', self.on_wheel)
         self.root.bind_class('TCombobox', '<MouseWheel>', self.on_wheel)
+        try:  # Tk 9 only
+            self.root.bind_all('<TouchpadScroll>', self.on_touchpad)
+            self.root.bind_class('TCombobox', '<TouchpadScroll>', self.on_touchpad)
+        except self.tk.TclError:
+            pass
         self.build_play()
         self.build_game()
         self.build_display()

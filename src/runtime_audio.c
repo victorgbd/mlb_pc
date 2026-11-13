@@ -267,6 +267,8 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
     return data ? (int32_t)samples : 0;
 }
 static ABI int32_t audio_output(int32_t handle, const void *data) { return output_port(handle,data,1); }
+/* Internal (Audio3d objects of a non-blocking push): queue a buffer without waiting. */
+static ABI int32_t audio_queue(int32_t handle, const void *data) { return output_port(handle,data,0); }
 typedef struct { int32_t handle; const void *data; } OutputParam;
 static ABI int32_t audio_outputs(const OutputParam *params, uint32_t count) {
     if (!params) return ERR_INVALID_POINTER;
@@ -323,6 +325,7 @@ static const RuntimeExport exports[]={
     {"sceAudioOutOutput",audio_output}, {"sceAudioOutOutputs",audio_outputs},
     {"sceAudioOutSetVolume",audio_volume}, {"sceAudioOutGetPortState",audio_state},
     {"sceAudioOutGetLastOutputTime",audio_last_time},
+    {"bbAudioOutQueue",audio_queue}, /* not a PS4 symbol: runtime_audio_function only */
 };
 /* An AudioOut function by its symbol name, for libraries that output through AudioOut (Audio3d). */
 void *runtime_audio_function(const char *symbol) {

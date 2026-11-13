@@ -74,6 +74,15 @@ public:
     /// picture into the display buffer before the UI (Uncharted). After it, frame generation
     /// copies that target: the frame without UI.
     void OnDrawRecorded(u64 ps_hash, VideoCore::ImageId color);
+    /// bbport: BB_FRAME_GEN_PS=<pixel shader hash>: the game's final pass into the display
+    /// buffer (MLB The Show 24: scene, bloom and UI in one draw), for games without a velocity
+    /// pass. Before it, frame generation takes the scene depth and zero motion vectors (FSR 3.1
+    /// interpolates with its own optical flow); the frame is interpolated with its UI.
+    void OnFrameGenPass(u64 ps_hash);
+    /// The scene depth is found without a velocity pass (BB_FRAME_GEN_PS set).
+    [[nodiscard]] bool SceneDepthMode() const noexcept {
+        return frame_gen_ps != 0;
+    }
 
     /// Start of a frame in the command stream (display pass).
     bool OnFrameStart();
@@ -213,6 +222,7 @@ private:
     FrameGenerator* frame_generator = nullptr;
     bool frame_gen_captured = false; ///< this frame's inputs are taken
     u64 hudless_hash = 0;
+    u32 frame_gen_ps = 0; ///< BB_FRAME_GEN_PS
     int applied_preset = -1;
     int applied_upscaler = -1;
     bool dispatched_last_frame = false;

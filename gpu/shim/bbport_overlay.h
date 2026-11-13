@@ -34,6 +34,8 @@ bool Visible();
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
 /// Every presented frame (FPS readout; BB_FPS_LOG=1 prints the rate every 5 seconds).
 void NotePresent();
+/// Frame generation counts for BB_FPS_LOG: frames generated and shown, and dropped.
+void NoteGenerated(unsigned shown, unsigned dropped);
 
 /// Any thread: queues the notice of an earned trophy (grade 1 platinum .. 4 bronze, `png` the
 /// trophy's icon file or empty). Notices are shown at the top of the screen one after the other.

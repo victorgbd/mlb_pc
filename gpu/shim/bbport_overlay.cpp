@@ -986,6 +986,12 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_text = text;
 }
 
+static std::atomic<unsigned> generated_shown{0}, generated_dropped{0};
+void NoteGenerated(unsigned shown, unsigned dropped) {
+    generated_shown.fetch_add(shown, std::memory_order_relaxed);
+    generated_dropped.fetch_add(dropped, std::memory_order_relaxed);
+}
+
 // Called for every presented frame: the interval for the FPS readout and BB_FPS_LOG.
 void NotePresent() {
     const auto now = std::chrono::steady_clock::now();
@@ -1008,7 +1014,17 @@ void NotePresent() {
         worst = std::max(worst, ms < 1000.0f ? ms : 0.0f);
         const float elapsed = std::chrono::duration<float>(now - window_start).count();
         if (elapsed >= 5.0f) {
-            std::printf("Frame rate: %.1f FPS, slowest frame %.1f ms\n", frames / elapsed, worst);
+            const unsigned shown = generated_shown.exchange(0, std::memory_order_relaxed);
+            const unsigned dropped = generated_dropped.exchange(0, std::memory_order_relaxed);
+            if (shown || dropped) {
+                std::printf("Frame rate: %.1f FPS (game %.1f, %u generated shown, %u dropped), "
+                            "slowest frame %.1f ms\n",
+                            frames / elapsed, (frames - int(shown)) / elapsed, shown, dropped,
+                            worst);
+            } else {
+                std::printf("Frame rate: %.1f FPS, slowest frame %.1f ms\n", frames / elapsed,
+                            worst);
+            }
             window_start = now;
             frames = 0;
             worst = 0.0f;

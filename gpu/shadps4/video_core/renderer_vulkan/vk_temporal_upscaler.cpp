@@ -257,6 +257,14 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
     if (const char* hash = std::getenv("BB_HUDLESS_PS")) {
         hudless_hash = u32(std::strtoull(hash, nullptr, 16));
     }
+    if (const char* hash = std::getenv("BB_FRAME_GEN_PS")) {
+        frame_gen_ps = u32(std::strtoull(hash, nullptr, 16));
+        if (frame_gen_ps) {
+            std::printf("Frame generation: inputs before pixel shader %08x (scene depth, "
+                        "optical flow)\n",
+                        frame_gen_ps);
+        }
+    }
     if (const char* res = std::getenv("BB_OUTPUT_RES")) {
         u32 w = 0, h = 0;
         if (std::sscanf(res, "%ux%u", &w, &h) == 2 && w && h) {
@@ -1390,9 +1398,28 @@ void TemporalUpscaler::CaptureFrameGen() {
     // The same motion vectors the upscaler computes: camera motion, previous minus current.
     if (const vk::ImageView motion = frame_generator->BeginCapture(cmdbuf, depth_view, w, h)) {
         camera_motion.RecordVelocity(cmdbuf, depth_view, motion, w, h);
+        // Without a velocity pass the vectors are zero on purpose (not a missing camera):
+        // the frames stay related and FSR 3.1's optical flow gives the motion.
         frame_generator->EndCapture(cmdbuf, Active() ? jitter : std::array<float, 2>{},
-                                    camera_motion.Ready());
+                                    camera_motion.VelocityMode() ? camera_motion.Ready() : true);
     }
+}
+
+void TemporalUpscaler::OnFrameGenPass(u64 ps_hash) {
+    if (!frame_gen_ps || u32(ps_hash) != frame_gen_ps || frame_gen_captured ||
+        !frame_generator || !frame_generator->Wanted()) {
+        return;
+    }
+    frame_gen_captured = true;
+    if (!camera_motion.Depth()) {
+        static int reported = 0;
+        if (reported++ < 3) {
+            std::printf("Frame generation: no scene depth before pixel shader %08x\n",
+                        frame_gen_ps);
+        }
+        return;
+    }
+    CaptureFrameGen();
 }
 
 void TemporalUpscaler::OnDrawRecorded(u64 ps_hash, VideoCore::ImageId color) {

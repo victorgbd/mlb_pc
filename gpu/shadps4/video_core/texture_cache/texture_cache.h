@@ -438,6 +438,9 @@ private:
     std::unordered_set<ImageId> tiny_download_images;
     /// bbport: whether the image is such a result: at most 4x4 pixels, linear or 1x1.
     [[nodiscard]] static bool TinyReadback(const Image& image);
+    /// bbport: whether the image is a render target the game reads on the CPU, by its size
+    /// (BB_READBACK_TARGETS): copied back to guest memory after the passes that draw it.
+    [[nodiscard]] static bool ReadbackTarget(const Image& image);
     PageTable page_table;
     std::mutex mutex;
     // bbport: FindImage results for unchanged image registrations (guarded by `mutex`).

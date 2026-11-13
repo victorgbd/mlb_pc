@@ -40,7 +40,20 @@ static uint64_t pool_size_bytes(void) {
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
-#define USER_MAX UINT64_C(0xfc00000000)
+#define USER_MAX_DEFAULT UINT64_C(0xfc00000000)
+/* Top of the guest range. BB_USER_MAX (hex) lowers it for hosts with a smaller address space:
+ * Android kernels usually give a process 39 bits (512 GiB), so the default top cannot be
+ * reserved there (Winlator, Box64). It stays above MLB's fixed pools (up to 0x1380000000). */
+static uintptr_t user_max_value(void) {
+    static uintptr_t value;
+    if (!value) {
+        const char *env=getenv("BB_USER_MAX");
+        uintptr_t v=env ? (uintptr_t)strtoull(env,NULL,16) & ~(uintptr_t)0x3fffffff : 0;
+        value=(v>=UINT64_C(0x2000000000) && v<=USER_MAX_DEFAULT) ? v : USER_MAX_DEFAULT;
+    }
+    return value;
+}
+#define USER_MAX user_max_value()
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
@@ -174,11 +187,15 @@ static void reserve_failed(void) {
         }
     }
     SetLastError(error);
+    if (USER_MAX==USER_MAX_DEFAULT)
+        printf("Runtime: on a host with a 39-bit address space (Android), set BB_USER_MAX=7000000000\n");
     win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
 }
 /* The guest range is reserved before anything else can be placed there (runtime_start). */
 void runtime_memory_reserve(void) {
     if (region_count) return;
+    if (USER_MAX!=USER_MAX_DEFAULT)
+        printf("Runtime: PS4 address range 0x%" PRIx64 "-0x%" PRIx64 " (BB_USER_MAX)\n",USER_MIN,(uint64_t)USER_MAX);
     if (getenv("BB_TEST_OCCUPY") && !getenv("BB_RESERVE_TRY")) VirtualAlloc((void *)0x1400000000ull,0x10000,MEM_RESERVE,PAGE_NOACCESS);
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
         reserve_failed();
@@ -460,6 +477,8 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         if (!map_base) {
             const char *env=getenv("BB_MAP_BASE");
             map_base=env ? (uintptr_t)strtoull(env,NULL,16) : (uintptr_t)UINT64_C(0x8000000000);
+            /* A lowered BB_USER_MAX: halfway up the range, still above the fixed pools. */
+            if (!env && map_base>=USER_MAX) map_base=((USER_MIN+USER_MAX)/2) & ~(uintptr_t)0x3fffffff;
             if (map_base<USER_MIN || map_base>=USER_MAX) map_base=USER_MIN;
         }
         address=find_free(address ? address : map_base,size,alignment);

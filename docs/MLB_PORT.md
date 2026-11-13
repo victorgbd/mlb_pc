@@ -24,7 +24,7 @@ scripts change), then starts `out/bb-probe.exe`. The log is printed to the conso
 - **Imports:** the eboot and its three modules import 634 functions from the system. 465 were
   already in the Uncharted runtime; the other 169 are new:
   - `src/runtime_mlb.c`: libSceJson2 (a real parser behind the SDK's `sce::Json` objects),
-    Audio3d (ports run, AudioOut ports play, 3D objects are not rendered yet), USB storage,
+    Audio3d (ports run, AudioOut ports play, objects mixed to stereo: see "Songs" below), USB storage,
     browser/sign-in/USB dialogs (refused), touch gestures (no events), core dumps, PS VR,
     game intents, live streaming, share play, random numbers, temporary data, RFC 3339 dates,
     and kernel functions libc and the game call at start;
@@ -51,6 +51,10 @@ scripts change), then starts `out/bb-probe.exe`. The log is printed to the conso
 - **Mapping addresses:** mappings without an address start at `BB_MAP_BASE` (0x8000000000).
   First-fit from 0x1000000000 had put the first direct mappings where the game later maps its
   pools at fixed addresses, which replaced its shaders ("Shader binary info not found").
+- **Address range top:** the runtime reserves the PS4 range 0x1000000000-0xfc00000000 at start.
+  Hosts with a 39-bit address space (Android kernels, under Winlator/Box64) cannot hold it:
+  `BB_USER_MAX` (hex, at least 0x2000000000) lowers the top, for example `7000000000`, and
+  `BB_MAP_BASE` then defaults to halfway up the range (0x4000000000), above the fixed pools.
 - `sceKernelLoadStartModule` of an already linked module (PS4/ffmpeg.prx) succeeds; `/download1`
   is mounted; `sceSystemServiceGetPlatformPrivacySetting` takes one pointer.
 
@@ -183,6 +187,12 @@ come from the player's `sce_sys/` at run time.
 
 - `tools/thread_sample.c`: where each thread of a running game is (hangs, busy waits).
 
+- `BB_WATCH_WRITE=address` (hex, 4-byte aligned; `BB_WATCH_WRITE_LEN=8` for eight bytes): a
+  hardware watchpoint on guest memory. Each write prints `Watch: write N by guest+0x...` with the
+  code offset after the writing instruction, the 16 bytes there as floats and the code addresses
+  on the stack (the first 60 writes). `BB_CAPTURE_FLIPS=N` makes an F10 capture
+  (`BB_TEXTURE_DUMP=1`) span N flips instead of 4, to record something that happens once.
+
 - `python tools/import_gap.py aerolib.inl GAME_DIR` lists the game's system imports that the
   runtime does not provide (a static check: a provided function may still be a simple stub).
   `aerolib.inl` is `src/core/aerolib/aerolib.inl` from shadPS4.
@@ -207,6 +217,54 @@ GPU-built faces, 2 of 4 were black; after the change, none of 6.
 - Alpha to coverage honours `DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE` (a pixel shader opting out
   while the register stays enabled). Shader cache version 16.
 
+### Noise in the faces (coloured beards, see-through faces)
+
+The game compresses each face on the GPU by writing an uncompressed image with one texel per
+block (R32G32 over BC1, R32G32B32A32 over BC7) at addresses it reuses. When the compressed
+texture of an earlier face was still cached there, the write went through an uncompressed view
+of the compressed image, which is not a valid view, and the face came out as noise, on different
+players in each session.
+
+- `TextureCache::ResolveOverlap`: an uncompressed image requested where a compressed one of the
+  same block size is cached is re-made (`ExpandImage`), the reverse of the existing case;
+  `Texture cache: ... re-made as ...` reports the first 30.
+
+### Black skin of players without a face scan (the skin tone palette)
+
+Evan Carter and Josh H. Smith (generic heads: no photo on their cards either) kept a black
+face with correct eyebrows, beard and relief, in games and on player cards. Their skin is the
+base head texture times `tone / average` in pixel shader c65e272e, and the tone reached the
+shader as (0, 0, 0, 0).
+
+- The tone comes from `SkinTonePalette2016`, an RGBA8 256x512 texture (1D thin tiled, at
+  0x8051ff1800) that a compute shader fills once at start (32x64 groups). The game then copies
+  the texture's memory into a table (guest function 0x185fd90) and looks the colour up on the
+  CPU (0x1860270). GPU-written images stay on the GPU here: the table was 524 288 zero bytes
+  while the GPU image held the right gradient (texture dump).
+- `BB_READBACK_TARGETS=WxH[,WxH...]` (run.py sets `256x512`): images of these sizes that a
+  shader writes (storage images, render targets) are copied back to guest memory at the next
+  end-of-pipe event or submission (`TextureCache::ReadbackTarget`), 1D thin tiled ones re-tiled
+  on the CPU (`RetileMicro`: the guest detiles what it reads). The log shows
+  `Texture cache: GPU-written 256x512 ... is read back to guest memory` once at start.
+- Found with `BB_WATCH_WRITE` (below): the constants' second half was written as zeros by guest
+  code at +0x1870f84, from the palette lookup.
+
+## Songs (Audio3d objects)
+
+The licensed songs were silent while everything else played. The game decodes them like its
+other streams (ATRAC9 XVAGs packed in `PS4/AUDIO/MUSIC1.SKX`), but plays them as four Audio3d
+objects (mono float PCM, 256 samples per granule, a gain and passthrough left/right; two carry
+sound while a song plays), not through its AudioOut mix. `sceAudio3dObjectSetAttributes` dropped
+them.
+
+- `runtime_mlb.c`: each Audio3d port mixes its objects' buffers into a stereo granule
+  (passthrough left/right to that side, others to both at -3 dB, gain applied; positions are not
+  rendered), `sceAudio3dPortAdvance` closes it and `sceAudio3dPortPush` plays it through an
+  AudioOut port of its own (2 ch float; a blocking push is paced by it). The log shows
+  `Audio3d port 0 plays its objects (stereo)`.
+- `BB_AUDIO3D_OBJECTS=0`: objects dropped as before. `BB_AUDIO_TRACE=1` also sums what the objects
+  carry every 5 seconds.
+
 ## Known gaps
 
 - `sceKernelGetModuleInfoForUnwind`: module tables are not given to the guest, so a C++
@@ -216,4 +274,21 @@ GPU-built faces, 2 of 4 were black; after the change, none of 6.
 - `g_guest_frames` (the guest frame counter used by the buffer cache's reports) stays 0: its
   hooks are Uncharted's.
 - The upscaler, frame generation and resolution options need MLB's renderer passes identified
-  (docs/upscaler.md); until then they stay off.
+  (docs/upscaler.md); until then they stay off. What is known (2026-11-11):
+  - MLB renders forward: scene color RGBA16F 1920x1080 with depth D32S8 1920x1080; no G-buffer,
+    no velocity buffer, no temporal AA. One final pass (ps c684cde1) composes the scene, the
+    bloom (512x512) and the UI (its own RGBA8 target) into the display buffer. The temporal
+    upscalers' trigger (compute 9a9cf8a9, Bloodborne's) never runs in MLB: the "FSR 3.1" shown
+    by the FPS counter does nothing.
+  - The resolution patch (`BB_GAME_RES`) finds no display configuration in MLB
+    ("0 stores changed").
+  - Frame generation without a velocity pass: `BB_FRAME_GEN=fsr3 BB_FRAME_GEN_PS=c684cde1` takes
+    the scene depth and zero motion vectors before the final pass (FSR 3.1 interpolates with its
+    optical flow, UI included). Menus: 60 game FPS shown as 120 with no dropped frames. In a game
+    on a GTX 1650 (4 GB) it runs out of video memory: the game fell to 5 FPS, then
+    `AllocateArenaMemory: ErrorOutOfDeviceMemory`. It needs the game's video memory use lowered
+    first (the texture cache reports about 4.4 GiB in use in a game on that card).
+  - Frame captures now include indirect draws and dispatches; `BB_FPS_LOG=1` reports game and
+    generated frames separately.
+- Game speed on a 4-core laptop (i5-10300H): about 30 FPS in a game, limited by the GPU command
+  processor thread (87% of a core) while the GPU is half idle.
