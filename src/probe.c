@@ -1750,7 +1750,9 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     if (getenv("BB_WATCH")) CloseHandle(CreateThread(NULL,0,watch_thread,getenv("BB_WATCH"),0,NULL));
     if (getenv("BB_WATCH_WRITE")) {
-        watch_write_address=(uintptr_t)strtoull(getenv("BB_WATCH_WRITE"),NULL,16);
+        const char *spec=getenv("BB_WATCH_WRITE");
+        /* "+offset": relative to the loaded image (the image base changes between runs). */
+        watch_write_address=spec[0]=='+' ? (uintptr_t)image+(uintptr_t)strtoull(spec+1,NULL,16) : (uintptr_t)strtoull(spec,NULL,16);
         if (watch_write_address) CloseHandle(CreateThread(NULL,0,watch_write_thread,NULL,0,NULL));
     }
 #endif

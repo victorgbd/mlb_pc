@@ -3,6 +3,13 @@
 
 EXTRA_TRANSLATIONS = {
     'de': {
+        'Aspect ratio': 'Seitenverhältnis',
+        'The shape of the picture: the view widens at the sides (nothing is stretched) and the menus spread over the width. Shapes other than 16:9 draw at most as many pixels as 1920 × 1080 and the window or screen enlarges them with FSR 1; the render resolution then applies as a percentage.':
+        'Die Form des Bildes: Die Sicht wird an den Seiten breiter (nichts wird gestreckt) und die Menüs verteilen sich über die Breite. Andere Formen als 16:9 zeichnen höchstens so viele Pixel wie 1920 × 1080, Fenster oder Bildschirm vergrößern sie mit FSR 1; die Renderauflösung gilt dann als Prozentsatz.',
+        'Render resolution': 'Renderauflösung',
+        'Native: 1920 × 1080': 'Nativ: 1920 × 1080',
+        'The 3D scene is drawn at this size and FSR 1 rebuilds it at 1920 × 1080 before the HUD is added, so menus and text stay sharp. Lower sizes run faster on weaker graphics cards.':
+        'Die 3D-Szene wird in dieser Größe gezeichnet und von FSR 1 auf 1920 × 1080 rekonstruiert, bevor das HUD hinzukommt; Menüs und Texte bleiben scharf. Kleinere Größen laufen auf schwächeren Grafikkarten schneller.',
         'AMD RCAS after FSR 1 (only while the image is enlarged).':
         'AMD RCAS nach FSR 1 (nur wenn das Bild vergrößert wird).',
         'Anti-aliasing': 'Kantenglättung',
@@ -101,6 +108,13 @@ EXTRA_TRANSLATIONS = {
         'version {}': 'Version {}',
     },
     'it': {
+        'Aspect ratio': 'Rapporto d’aspetto',
+        'The shape of the picture: the view widens at the sides (nothing is stretched) and the menus spread over the width. Shapes other than 16:9 draw at most as many pixels as 1920 × 1080 and the window or screen enlarges them with FSR 1; the render resolution then applies as a percentage.':
+        'La forma dell’immagine: la visuale si allarga ai lati (nulla viene stirato) e i menu si distribuiscono sulla larghezza. Fuori dal 16:9 il gioco disegna al massimo tanti pixel quanti a 1920 × 1080 e la finestra o lo schermo li ingrandisce con FSR 1; la risoluzione di rendering vale allora come percentuale.',
+        'Render resolution': 'Risoluzione di rendering',
+        'Native: 1920 × 1080': 'Nativa: 1920 × 1080',
+        'The 3D scene is drawn at this size and FSR 1 rebuilds it at 1920 × 1080 before the HUD is added, so menus and text stay sharp. Lower sizes run faster on weaker graphics cards.':
+        "La scena 3D viene disegnata a questa dimensione e FSR 1 la ricostruisce a 1920 × 1080 prima di aggiungere l'HUD, così menu e testi restano nitidi. Le dimensioni minori sono più veloci sulle schede grafiche meno potenti.",
         'AMD RCAS after FSR 1 (only while the image is enlarged).':
         "AMD RCAS dopo FSR 1 (solo quando l'immagine viene ingrandita).",
         'Anti-aliasing': 'Antialiasing',
@@ -199,6 +213,13 @@ EXTRA_TRANSLATIONS = {
         'version {}': 'versione {}',
     },
     'ja': {
+        'Aspect ratio': 'アスペクト比',
+        'The shape of the picture: the view widens at the sides (nothing is stretched) and the menus spread over the width. Shapes other than 16:9 draw at most as many pixels as 1920 × 1080 and the window or screen enlarges them with FSR 1; the render resolution then applies as a percentage.':
+        '画面の形です。視野が左右に広がり(引き伸ばしはしません)、メニューは横幅いっぱいに配置されます。16:9 以外では 1920 × 1080 と同じピクセル数までで描画し、ウィンドウや画面に FSR 1 で拡大します。レンダリング解像度はその場合パーセンテージとして適用されます。',
+        'Render resolution': 'レンダリング解像度',
+        'Native: 1920 × 1080': 'ネイティブ: 1920 × 1080',
+        'The 3D scene is drawn at this size and FSR 1 rebuilds it at 1920 × 1080 before the HUD is added, so menus and text stay sharp. Lower sizes run faster on weaker graphics cards.':
+        '3Dシーンをこのサイズで描画し、HUDを重ねる前にFSR 1で1920 × 1080に再構成します。メニューや文字は鮮明なままです。小さいサイズほど性能の低いグラフィックカードで高速に動作します。',
         'AMD RCAS after FSR 1 (only while the image is enlarged).':
         'FSR 1 適用後の AMD RCAS（画像を拡大する場合のみ）。',
         'Anti-aliasing': 'アンチエイリアス',

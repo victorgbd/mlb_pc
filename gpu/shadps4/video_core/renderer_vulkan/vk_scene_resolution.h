@@ -9,6 +9,8 @@
 #include "video_core/renderer_vulkan/scene_resolution.h"
 #include "video_core/texture_cache/image.h"
 
+namespace Vulkan::HostPasses { class FsrPass; }
+
 namespace VideoCore { class TextureCache; }
 namespace Vulkan {
 class Instance;
@@ -64,6 +66,10 @@ public:
         return !copying && tracked.contains(image_uid);
     }
     void ResolveAll();
+    /// BB_RENDER_SCALE: the proxies of 1920x1080 color targets written since their last resolve
+    /// are rebuilt into their native images with FSR 1 (EASU, then RCAS when `sharpen`); the
+    /// native images are current afterwards. Integer formats and depth keep the lazy resolve.
+    void UpscaleColors(bool sharpen, float rcas_attenuation);
     bool debug = false; ///< BB_SCENE_DEBUG frame: print resolves and fills
 private:
     struct Entry {
@@ -74,6 +80,7 @@ private:
         std::vector<std::pair<VideoCore::ImageViewInfo, vk::UniqueImageView>> views;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
         SceneResolution::Coherence state;
+        vk::UniqueImageView easu_view; ///< sampled view for UpscaleColors
     };
     static constexpr u64 Key(u64 uid, u32 level) {
         return uid << 4 | level;
@@ -100,6 +107,7 @@ private:
     std::unordered_map<u64, std::unique_ptr<Entry>> entries; ///< by Key(uid, level)
     std::unordered_set<u64> tracked; ///< uids with proxies
     bool copying = false;
+    std::unique_ptr<HostPasses::FsrPass> fsr; ///< UpscaleColors
     bool force_stencil_bits = false; ///< test the portable resampler on any driver
     u64 generation = 0;
     mutable std::unordered_map<vk::Format, vk::FormatFeatureFlags> format_features;

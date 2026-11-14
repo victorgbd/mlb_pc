@@ -72,9 +72,22 @@ FRAME_RATES = [('30', '30 FPS'), ('60', '60 FPS (as on PS4)')]
 # or bilinear when it is enlarged, then RCAS sharpening (BB_RCAS_ATTENUATION, lower is sharper).
 WINDOW_SIZES = [('1280x720', '1280 × 720'), ('1600x900', '1600 × 900'),
                 ('1920x1080', '1920 × 1080'), ('2560x1440', '2560 × 1440'),
-                ('3840x2160', '3840 × 2160 (4K)')]
+                ('3840x2160', '3840 × 2160 (4K)'), ('1920x1200', '1920 × 1200 (16:10)'),
+                ('2560x1600', '2560 × 1600 (16:10)'), ('2560x1080', '2560 × 1080 (21:9)'),
+                ('3440x1440', '3440 × 1440 (21:9)'), ('3840x1080', '3840 × 1080 (32:9)'),
+                ('5120x1440', '5120 × 1440 (32:9)')]
+# The game's own size for another picture shape (BB_MLB_RES, src/runtime_display.c): at most a
+# 1920x1088 area of 128x64-aligned pixels (the game stops above it), enlarged by the presenter.
+ASPECTS = [('16:9', '16:9 (1920 × 1080)'), ('16:10', '16:10 (1728 × 1080)'),
+           ('21:9', '21:9 (2176 × 928)'), ('32:9', '32:9 (2688 × 756)')]
+ASPECT_SIZES = {'16:10': '1728x1080', '21:9': '2176x928', '32:9': '2688x756'}
 SPEAKERS = [('auto', 'Automatic (the Windows speaker setup)'), ('2', 'Stereo'), ('6', '5.1 surround'), ('8', '7.1 surround')]
 SCALERS = [('fsr1', 'FSR 1 (AMD FidelityFX, sharp)'), ('bilinear', 'Smooth (bilinear)')]
+# The size the 3D scene is drawn at (BB_RENDER_SCALE); FSR 1 rebuilds it at 1920x1080 before the
+# game's final composite adds the HUD (gpu: SceneTargets::UpscaleColors).
+RENDER_SCALES = [('1920x1080', 'Native: 1920 × 1080'), ('1600x900', '1600 × 900 (83%)'),
+                 ('1440x810', '1440 × 810 (75%)'), ('1280x720', '1280 × 720 (67%)'),
+                 ('1120x630', '1120 × 630 (58%)'), ('960x540', '960 × 540 (50%)')]
 SHARPENING = [('off', 'Off'), ('1000', 'Low'), ('500', 'Medium'), ('250', 'High'), ('0', 'Maximum')]
 # Controls (input.ini, read by the game: src/runtime_pad.c). Actions with their PS4 names, the
 # default keys ("A|B": two bindings) and the default controller buttons (SDL names).
@@ -135,6 +148,7 @@ GRAPHICS_FIXES = [
 APP_DEFAULTS = {'game_dir': '', 'user_dir': '', 'language': '1', 'ui_language': '', 'player_name': '',
                 'fullscreen': False, 'present_mode': 'Mailbox', 'frame_rate': '60', 'show_fps': False,
                 'window_size': '1920x1080', 'speakers': 'auto', 'scaler': 'fsr1', 'sharpening': '500',
+                'render_scale': '1920x1080', 'aspect': '16:9',
                 'extra_env': '', 'close_on_play': False, 'pad_invert_y': False,
                 'art_banner': '', 'art_cover': '', 'steam_art': '', 'art_crops': {},
                 'shortcut_name': GAME_TITLE, 'shortcut_icon': '', 'pad_vibration': True,
@@ -374,10 +388,20 @@ def game_environment(s):
     if str(s.get('speakers') or 'auto') != 'auto':
         env['BB_SPEAKERS'] = str(s['speakers'])
     env['BB_FSR1'] = '1' if s.get('scaler', 'fsr1') == 'fsr1' else '0'
+    game_size = ASPECT_SIZES.get(str(s.get('aspect') or '16:9'))
+    if game_size:
+        env['BB_MLB_RES'] = game_size
+    render_scale = str(s.get('render_scale') or '1920x1080')
+    if render_scale != '1920x1080' and render_scale in {v for v, _t in RENDER_SCALES}:
+        # Another shape: the same share of the game's size (the sizes listed are 16:9).
+        env['BB_RENDER_SCALE'] = (str(round(int(render_scale.split('x')[0]) * 100 / 1920))
+                                  if game_size else render_scale)
     sharpening = str(s.get('sharpening') or 'off')
     env['BB_RCAS'] = '0' if sharpening == 'off' else '1'
     if sharpening != 'off':
         env['BB_RCAS_ATTENUATION'] = sharpening
+    # The same sharpening for the scene rebuilt by FSR 1 (RCAS attenuation, lower is sharper).
+    env['BB_RENDER_SHARPNESS'] = '-1' if sharpening == 'off' else f'{int(sharpening) / 1000:g}'
     for key, variable, _title, _hint in GRAPHICS_FIXES:
         if not s.get(key, True):
             env[variable] = '0'
@@ -1167,6 +1191,10 @@ class Launcher:
         self.row(f, _('Window size'), self.choice(f, 'window_size', WINDOW_SIZES, 34),
                  _('The game draws at 1920 × 1080; the window (or the screen in fullscreen) shows that picture '
                    'scaled to fit.'))
+        self.row(f, _('Aspect ratio'), self.choice(f, 'aspect', ASPECTS, 34),
+                 _('The shape of the picture: the view widens at the sides (nothing is stretched) and the menus spread over the width. Shapes other than 16:9 draw at most as many pixels as 1920 × 1080 and the window or screen enlarges them with FSR 1; the render resolution then applies as a percentage.'))
+        self.row(f, _('Render resolution'), self.choice(f, 'render_scale', RENDER_SCALES, 34),
+                 _('The 3D scene is drawn at this size and FSR 1 rebuilds it at 1920 × 1080 before the HUD is added, so menus and text stay sharp. Lower sizes run faster on weaker graphics cards.'))
         self.row(f, _('Upscaling'), self.choice(f, 'scaler', SCALERS, 34),
                  _('FSR 1 keeps edges sharp when the image is enlarged; bilinear is softer.'))
         self.row(f, _('Sharpening'), self.choice(f, 'sharpening', SHARPENING, 34),

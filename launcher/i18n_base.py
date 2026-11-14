@@ -27,6 +27,13 @@ def language_code(value=''):
 
 TRANSLATIONS = {
     'es': {
+        'Aspect ratio': 'Relación de aspecto',
+        'The shape of the picture: the view widens at the sides (nothing is stretched) and the menus spread over the width. Shapes other than 16:9 draw at most as many pixels as 1920 × 1080 and the window or screen enlarges them with FSR 1; the render resolution then applies as a percentage.':
+        'La forma de la imagen: la vista se ensancha por los lados (nada se estira) y los menús se reparten por el ancho. Fuera de 16:9 el juego dibuja como mucho tantos píxeles como a 1920 × 1080 y la ventana o la pantalla los amplía con FSR 1; la resolución de renderizado se aplica entonces como porcentaje.',
+        'Render resolution': 'Resolución de renderizado',
+        'Native: 1920 × 1080': 'Nativa: 1920 × 1080',
+        'The 3D scene is drawn at this size and FSR 1 rebuilds it at 1920 × 1080 before the HUD is added, so menus and text stay sharp. Lower sizes run faster on weaker graphics cards.':
+        'La escena 3D se dibuja a este tamaño y FSR 1 la reconstruye a 1920 × 1080 antes de añadir el HUD, así que los menús y textos siguen nítidos. Los tamaños menores van más rápido en tarjetas gráficas modestas.',
         'Automatic (Windows)': 'Automático (Windows)', 'Play': 'Jugar', 'Stop': 'Detener',
         'Game': 'Juego', 'Display': 'Pantalla', 'Controls': 'Controles', 'Advanced': 'Avanzado',
         'Log': 'Registro', 'Library': 'Biblioteca', 'Double-click a cover to launch':
@@ -142,6 +149,13 @@ TRANSLATIONS = {
         'by {}': 'por {}', 'see the Log page': 'consulta la página Registro',
     },
     'pt': {
+        'Aspect ratio': 'Proporção da tela',
+        'The shape of the picture: the view widens at the sides (nothing is stretched) and the menus spread over the width. Shapes other than 16:9 draw at most as many pixels as 1920 × 1080 and the window or screen enlarges them with FSR 1; the render resolution then applies as a percentage.':
+        'O formato da imagem: a visão se alarga nas laterais (nada é esticado) e os menus se distribuem pela largura. Fora de 16:9 o jogo desenha no máximo tantos pixels quanto em 1920 × 1080 e a janela ou a tela os amplia com o FSR 1; a resolução de renderização passa a valer como porcentagem.',
+        'Render resolution': 'Resolução de renderização',
+        'Native: 1920 × 1080': 'Nativa: 1920 × 1080',
+        'The 3D scene is drawn at this size and FSR 1 rebuilds it at 1920 × 1080 before the HUD is added, so menus and text stay sharp. Lower sizes run faster on weaker graphics cards.':
+        'A cena 3D é desenhada neste tamanho e o FSR 1 a reconstrói em 1920 × 1080 antes de adicionar o HUD, então menus e textos continuam nítidos. Tamanhos menores rodam mais rápido em placas de vídeo modestas.',
         'Automatic (Windows)': 'Automático (Windows)', 'Play': 'Jogar', 'Stop': 'Parar',
         'Game': 'Jogo', 'Display': 'Tela', 'Controls': 'Controles', 'Advanced': 'Avançado',
         'Log': 'Registro', 'Library': 'Biblioteca', 'Double-click a cover to launch':
@@ -256,6 +270,13 @@ TRANSLATIONS = {
         'by {}': 'por {}', 'see the Log page': 'consulte a página Registro',
     },
     'fr': {
+        'Aspect ratio': 'Format d’image',
+        'The shape of the picture: the view widens at the sides (nothing is stretched) and the menus spread over the width. Shapes other than 16:9 draw at most as many pixels as 1920 × 1080 and the window or screen enlarges them with FSR 1; the render resolution then applies as a percentage.':
+        'La forme de l’image : la vue s’élargit sur les côtés (rien n’est étiré) et les menus occupent toute la largeur. Hors 16:9, le jeu dessine au plus autant de pixels qu’en 1920 × 1080 et la fenêtre ou l’écran les agrandit avec FSR 1 ; la résolution de rendu s’applique alors en pourcentage.',
+        'Render resolution': 'Résolution de rendu',
+        'Native: 1920 × 1080': 'Native : 1920 × 1080',
+        'The 3D scene is drawn at this size and FSR 1 rebuilds it at 1920 × 1080 before the HUD is added, so menus and text stay sharp. Lower sizes run faster on weaker graphics cards.':
+        'La scène 3D est dessinée à cette taille et FSR 1 la reconstruit en 1920 × 1080 avant d’ajouter l’interface : les menus et les textes restent nets. Les tailles plus petites sont plus rapides sur les cartes graphiques modestes.',
         'Automatic (Windows)': 'Automatique (Windows)', 'Play': 'Jouer', 'Stop': 'Arrêter',
         'Game': 'Jeu', 'Display': 'Affichage', 'Controls': 'Commandes', 'Advanced': 'Avancé',
         'Log': 'Journal', 'Library': 'Bibliothèque', 'Double-click a cover to launch':
