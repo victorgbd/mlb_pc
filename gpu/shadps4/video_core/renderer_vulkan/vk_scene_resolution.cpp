@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
+#include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -69,10 +70,12 @@ bool SceneTargets::ShaderResampled(const VideoCore::Image& image) const {
 }
 // 1 for the scene size, 2 for half resolution (the game's post-processing chain), else 0.
 // Half resolution needs a scene size that halves exactly: the proxy keeps the scene's factor,
-// so the shaders' FragCoord conversion (1920 / scene width) stays correct for it.
+// so the shaders' FragCoord conversion (native width / scene width) stays correct for it.
 static u32 SizeDivisor(const VideoCore::ImageInfo& i, SceneResolution::Size scene) {
-    if (i.size.width == 1920 && i.size.height == 1080) return 1;
-    if (i.size.width == 960 && i.size.height == 540 && scene.width % 2 == 0 &&
+    const auto& native = SceneResolution::Native();
+    if (i.size.width == native.width && i.size.height == native.height) return 1;
+    if (i.size.width == native.width / 2 && i.size.height == native.height / 2 &&
+        scene.width % 2 == 0 &&
         scene.height % 2 == 0 && !BbToggle::Disabled(BbToggle::SceneHalfRes)) {
         return 2;
     }
@@ -93,7 +96,9 @@ bool SceneTargets::Eligible(const VideoCore::Image& image) const {
     return Blittable(image.backing->image.image_ci.format) || ShaderResampled(image);
 }
 bool SceneTargets::EligibleScene(const VideoCore::Image& image) const {
-    return image.info.size.width == 1920 && image.info.size.height == 1080 && Eligible(image);
+    const auto& native = SceneResolution::Native();
+    return image.info.size.width == native.width && image.info.size.height == native.height &&
+           Eligible(image);
 }
 SceneResolution::Size SceneTargets::ProxySize(const VideoCore::Image& image, u32 level) const {
     const u32 div = std::max(1u, SizeDivisor(image.info, size));
@@ -108,8 +113,9 @@ bool SceneTargets::SetSize(SceneResolution::Size next) {
     ++generation;
     recent = {};
     size = next;
-    std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, UI 1920x1080 "
-                "(live)\n", size.width, size.height, size.width / 2, size.height / 2);
+    std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, UI %ux%u (live)\n",
+                size.width, size.height, size.width / 2, size.height / 2,
+                SceneResolution::Native().width, SceneResolution::Native().height);
     return true;
 }
 void SceneTargets::ResolveAll() {
@@ -117,6 +123,109 @@ void SceneTargets::ResolveAll() {
         if (entry->state.dirty) {
             if (auto* image = lookup(entry->source, entry->uid)) Copy(*entry, *image, true);
         }
+    }
+}
+static bool EasuFormat(vk::Format format) {
+    switch (format) {
+    case vk::Format::eR16G16B16A16Sfloat:
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eB8G8R8A8Unorm:
+    case vk::Format::eB8G8R8A8Srgb:
+    case vk::Format::eB10G11R11UfloatPack32:
+    case vk::Format::eA2B10G10R10UnormPack32:
+    case vk::Format::eA2R10G10B10UnormPack32:
+        return true;
+    default:
+        return false;
+    }
+}
+void SceneTargets::UpscaleColors(bool sharpen, float rcas_attenuation) {
+    if (!Reduced()) return;
+    for (auto& [key, entry] : entries) {
+        Entry& e = *entry;
+        if (!e.state.dirty || e.level != 0) continue;
+        auto* original = lookup(e.source, e.uid);
+        const auto& native = SceneResolution::Native();
+        if (!original || original->info.props.is_depth || original->info.size.width != native.width ||
+            original->info.size.height != native.height) {
+            continue;
+        }
+        const vk::Format format = e.image.image_ci.format;
+        if (!EasuFormat(format) || !(e.image.image_ci.usage & vk::ImageUsageFlagBits::eSampled)) {
+            continue; // resolved on demand (nearest blit) like before
+        }
+        if (!fsr) {
+            fsr = std::make_unique<HostPasses::FsrPass>();
+            fsr->Create(instance.GetDevice(), instance.GetAllocator(), 3);
+        }
+        if (!e.easu_view) {
+            e.easu_view = Check(instance.GetDevice().createImageViewUnique({
+                .image = e.image, .viewType = vk::ImageViewType::e2D, .format = format,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            }));
+        }
+        copying = true;
+        const Runtime::TransferMark mark{runtime, "scene proxy FSR 1", *original};
+        if (debug) {
+            std::printf("Scene FSR 1: %s %ux%u -> %ux%u\n", vk::to_string(format).c_str(),
+                        e.image.image_ci.extent.width, e.image.image_ci.extent.height, native.width,
+                        native.height);
+        }
+        Transition(e, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+                   vk::PipelineStageFlagBits2::eComputeShader,
+                   vk::AccessFlagBits2::eShaderSampledRead);
+        runtime.Transit(original, vk::ImageLayout::eTransferDstOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                        VideoCore::SubresourceRange{.base = {0, 0}, .extent = {1, 1}});
+        runtime.FlushBarriers();
+        const vk::ImageView input = *e.easu_view;
+        const vk::Extent2D in{e.image.image_ci.extent.width, e.image.image_ci.extent.height};
+        const vk::Image dst = original->GetImage();
+        auto* pass = fsr.get();
+        const vk::Extent2D out{native.width, native.height};
+        scheduler.Record([=](vk::CommandBuffer cmd) {
+            HostPasses::FsrPass::Settings settings{};
+            settings.enable = true;
+            settings.use_rcas = sharpen;
+            settings.rcas_attenuation = rcas_attenuation;
+            pass->Render(cmd, input, in, out, settings, false);
+            const vk::Image src = pass->LastOutputImage();
+            const vk::ImageSubresourceRange color{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+            const vk::ImageMemoryBarrier2 to_src{
+                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .image = src, .subresourceRange = color,
+            };
+            cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_src});
+            const vk::Offset3D full{s32(out.width), s32(out.height), 1};
+            const vk::ImageBlit region{
+                .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .srcOffsets = std::array{vk::Offset3D{}, full},
+                .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .dstOffsets = std::array{vk::Offset3D{}, full},
+            };
+            cmd.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
+                          vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+            // The pass reuses the image later (from an undefined layout): wait for this read.
+            const vk::ImageMemoryBarrier2 back{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .image = src, .subresourceRange = color,
+            };
+            cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &back});
+        });
+        // The native image holds the frame now: later reads sample it, not the proxy.
+        e.state.NativeWrite();
+        copying = false;
     }
 }
 void SceneTargets::NativeAccess(VideoCore::Image& image, vk::AccessFlags2 access) {

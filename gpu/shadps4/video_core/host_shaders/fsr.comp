@@ -66,14 +66,18 @@ void CurrFilter(AU2 pos)
     FsrEasuH(c, pos, Const0, Const1, Const2, Const3);
     if (Sample.x == 1)
     c *= c;
-    imageStore(OutputTexture, ASU2(pos), AH4(c, 1));
+    // bbport: alpha kept (bilinear): games keep data there (the scene upscale of SceneTargets).
+    const AF2 uv = (AF2(pos) * AF2_AU2(Const0.xy) + AF2_AU2(Const0.zw) + AF2_(0.5)) * AF2_AU2(Const1.xy);
+    const float alpha = textureLod(sampler2D(InputTexture, InputSampler), uv, 0.0).a;
+    imageStore(OutputTexture, ASU2(pos), vec4(vec3(c), alpha));
     #endif// SAMPLE_EASU
 #if SAMPLE_RCAS
     AH3 c;
     FsrRcasH(c.r, c.g, c.b, pos, Const0);
     if (Sample.x == 1)
     c *= c;
-    imageStore(OutputTexture, ASU2(pos), AH4(c, 1));
+    const float alpha = texelFetch(sampler2D(InputTexture, InputSampler), ASU2(pos), 0).a;
+    imageStore(OutputTexture, ASU2(pos), vec4(vec3(c), alpha));
     #endif// SAMPLE_RCAS
 }
 

@@ -1453,6 +1453,14 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         (scene_started || regs.color_buffers[0].Address() != frame_display_address ||
          BbToggle::Disabled(BbToggle::OneFrameStart))) {
         frame_display_address = regs.color_buffers[0].Address();
+        // BB_RENDER_SCALE: this final pass reads the scene: rebuild it at 1920x1080 with FSR 1.
+        if (SceneResolution::SpatialScaling() && scene_started) {
+            static const float rcas = [] {
+                const char* env = std::getenv("BB_RENDER_SHARPNESS");
+                return env ? float(std::atof(env)) : 0.25f;
+            }();
+            scene_targets->UpscaleColors(rcas >= 0.0f, std::max(rcas, 0.0f));
+        }
         scene_started = false;
         // bbport: frame generation's inputs before the final pass (BB_FRAME_GEN_PS), while
         // this frame's scene depth is still known.
@@ -4077,9 +4085,15 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     const auto& key = pipeline->GetGraphicsKey();
     if (std::popcount(key.mrt_mask & 0x7f) >= 5 && db_desc.first &&
         scene_targets->EligibleScene(texture_cache.GetImage(db_desc.first))) scene_started = true;
+    // BB_RENDER_SCALE: forward renderers (MLB: one RGBA16F color + D32S8) start the scene at the
+    // first pass with the 1920x1080 depth; passes without it (UI, post) are kept native below.
+    const bool spatial = SceneResolution::SpatialScaling();
+    if (spatial && key.mrt_mask && db_desc.first &&
+        scene_targets->EligibleScene(texture_cache.GetImage(db_desc.first))) scene_started = true;
     // A proxy attachment cannot represent MSAA or a feedback loop that reads the
     // same image through the guest's native descriptor during this draw.
-    bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1;
+    bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1 &&
+                   (!spatial || db_desc.first);
     // BB_SCENE_DEBUG=<file>: once the file exists, why the passes of one frame keep the
     // native size (see NoteFrameStart).
     const bool debug_pass = scene_debug_frame && scene_started;
@@ -4355,12 +4369,14 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
 
     if (reduced) {
-        // Half-resolution passes keep the scene's factor (proxy / native = scene / 1920).
+        // Half-resolution passes keep the scene's factor (proxy / native = scene / native).
         const auto size = scene_targets->Size();
         const auto proxy = pass_size.value_or(size);
         state.width = proxy.width;
         state.height = proxy.height;
-        target_scale = {float(size.width) / 1920.0f, float(size.height) / 1080.0f};
+        const auto& native = SceneResolution::Native();
+        target_scale = {float(size.width) / float(native.width),
+                        float(size.height) / float(native.height)};
     }
     if (FrameCapture::Active()) {
         std::array<const VideoCore::ImageInfo*, AmdGpu::NUM_COLOR_BUFFERS> colors{};

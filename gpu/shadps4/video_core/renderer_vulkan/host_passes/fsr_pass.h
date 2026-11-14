@@ -22,6 +22,11 @@ public:
     vk::ImageView Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
                          vk::Extent2D output_size, Settings settings, bool hdr);
 
+    /// bbport: the image behind the view the last Render returned (eShaderReadOnlyOptimal).
+    vk::Image LastOutputImage() const {
+        return last_output;
+    }
+
 private:
     struct Img {
         u8 id{};
@@ -49,6 +54,7 @@ private:
     vk::UniquePipeline rcas_pipeline{};
 
     vk::Extent2D cur_size{};
+    vk::Image last_output{};
     u32 cur_image{};
     std::vector<Img> available_imgs;
 };

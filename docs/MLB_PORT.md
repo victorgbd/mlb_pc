@@ -273,6 +273,32 @@ them.
 - Online features: the console is offline (no PSN, no servers).
 - `g_guest_frames` (the guest frame counter used by the buffer cache's reports) stays 0: its
   hooks are Uncharted's.
+- Render resolution (2026-11-14): `BB_RENDER_SCALE=WxH` (or a percentage; launcher: Display >
+  Render resolution) draws the scene smaller and FSR 1 rebuilds it. The scene starts at the first
+  pass with the 1920x1080 depth; passes with that depth draw into reduced `SceneTargets` proxies
+  (UI and post passes without it stay native). At the final composite (ps c684cde1, the pass
+  writing the display buffer), `SceneTargets::UpscaleColors` runs EASU (+ RCAS,
+  `BB_RENDER_SHARPNESS`, attenuation; negative = off) from each written color proxy into its
+  native image. fsr.comp now keeps the input alpha. In a match on the GTX 1650: 37 FPS native,
+  38 at 1280x720, 41 at 960x540 (the game is CPU-bound there; slower GPUs gain more).
+- Aspect ratio (2026-11-14): `BB_MLB_RES=WxH` (launcher: Display > Aspect ratio: 16:10 1728x1080,
+  21:9 2176x928, 32:9 2688x756) gives the game another size and shape (`src/runtime_display.c`).
+  MLB's video out setup copies its size from two rodata tables ({1920x1080, 2560x1440, 3200x1800,
+  3840x2160} for PS4 Pro, {1280x720, 1920x1080} for base) into the renderer's size globals; the
+  renderer, the projection (the view widens, nothing stretches) and the UI layout follow them.
+  The 1920x1080 table entries and the display frame buffer allocation (sized for a fixed 1920x1080:
+  `mov edx,0x780; mov ecx,0x438`) are patched. The presenter enlarges the picture to the window.
+  `SceneResolution::Native()` makes the render resolution scale the game's size (the launcher
+  passes a percentage then; scaled sizes are multiples of 8).
+  Limit: above a 1920x1088 area of 128x64-aligned pixels (1920x1200, 2240x960, 2208x928 fail;
+  1920x1088, 2176x928, 2688x756, 1728x1080 work) the title screen sends a depth target with
+  garbage registers (`z_format=2`, pitch 9064) and the GPU stops. Traced so far: the game's
+  `setDepthRenderTarget` (0x1cc9d70) copies a valid descriptor from its context (dumped:
+  z_info a010200b, size 1920x1200), yet the packet the GPU reads holds other values, and a
+  watchpoint on the packet sees no later CPU write. Not the render pool (growing it, and the
+  budget, through the base/Pro constants of the memory setup changed nothing), not
+  sceVideoOutGetResolutionStatus, not the Bink frame buffers. The runtime refuses larger sizes.
+  `BB_WATCH_WRITE=+offset` now watches an image-relative address (the image base moves).
 - The upscaler, frame generation and resolution options need MLB's renderer passes identified
   (docs/upscaler.md); until then they stay off. What is known (2026-11-11):
   - MLB renders forward: scene color RGBA16F 1920x1080 with depth D32S8 1920x1080; no G-buffer,

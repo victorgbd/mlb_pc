@@ -422,8 +422,12 @@ bool TemporalUpscaler::OnFrameStart() {
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
     // On GPUs without D32S8 blit support, UI depth is cleared instead of copied from scene.
     if (!scaled_session) {
-        scene_targets.SetSize(SceneResolution::ForPreset(active ? preset : 0,
-                                                        {target_width, target_height}));
+        // BB_RENDER_SCALE (spatial FSR 1, SceneTargets::UpscaleColors) wins over the presets.
+        scene_targets.SetSize(SceneResolution::SpatialScaling()
+                                  ? SceneResolution::SpatialSize()
+                              : active && preset ? SceneResolution::ForPreset(
+                                                         preset, {target_width, target_height})
+                                                   : SceneResolution::Size{});
         render_width = scene_targets.Size().width;
         render_height = scene_targets.Size().height;
         // Native AA (the only mode of this game) runs at the game's size on the HDR scene color:

@@ -384,6 +384,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         cmdbuf.endDebugUtilsLabelEXT();
     }
 
+    last_output = img.output_image;
     return img.output_image_view.get();
 }
 

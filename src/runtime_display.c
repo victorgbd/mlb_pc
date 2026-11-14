@@ -123,7 +123,46 @@ static int patch_movie_slots(unsigned char *image, uint64_t image_size, uint32_t
     return patched;
 }
 
+/* MLB The Show: BB_MLB_RES=WxH, the game's render and display size (another shape: 16:10, 21:9,
+ * 32:9). The video out setup picks its size from two tables in rodata, {1920x1080, 2560x1440,
+ * 3200x1800, 3840x2160} (PS4 Pro) followed by {1280x720, 1920x1080}, and copies the entry into the
+ * renderer's size globals; the 1920x1080 entries are rewritten. The renderer reads the size from
+ * there (projection, post-processing and the UI layout follow it), but the display frame buffers
+ * are allocated for a fixed 1920x1080 (mov edx,0x780; mov ecx,0x438; mov r8d,1; the surface size
+ * call), which is patched too.
+ * Limit: above a 1920x1088 area of 128x64-aligned pixels the title screen draws with a depth target
+ * whose registers are garbage (z_format 2) and the GPU stops; that memory has not been found, so
+ * larger sizes are refused. */
+static void patch_mlb_table(unsigned char *image, uint64_t image_size) {
+    const char *res=getenv("BB_MLB_RES");
+    unsigned w=0, h=0;
+    if (!res || sscanf(res,"%ux%u",&w,&h)!=2) return;
+    w&=~1u; h&=~1u;
+    if (w==1920 && h==1080) return;
+    const uint64_t area=(uint64_t)((w+127)&~127u)*((h+63)&~63u);
+    if (w<640 || h<360 || area>UINT64_C(1920)*1088) {
+        printf("Display: BB_MLB_RES %ux%u refused (the game works up to a 1920x1088 area, 128x64 aligned)\n",w,h);
+        return;
+    }
+    static const uint32_t sig[12]={1920,1080,2560,1440,3200,1800,3840,2160,1280,720,1920,1080};
+    int found=0;
+    for (uint64_t i=0;i+sizeof(sig)<=image_size;i+=4) {
+        if (memcmp(image+i,sig,sizeof(sig))) continue;
+        put32(image+i,w); put32(image+i+4,h);
+        put32(image+i+40,w); put32(image+i+44,h);
+        ++found;
+    }
+    static const unsigned char fb[]={0xba,0x80,0x07,0,0,0xb9,0x38,0x04,0,0,0x41,0xb8,1,0,0,0};
+    int buffers=0;
+    for (uint64_t i=0;i+sizeof(fb)<=image_size;++i) {
+        if (memcmp(image+i,fb,sizeof(fb))) continue;
+        put32(image+i+1,w); put32(image+i+6,h); ++buffers;
+    }
+    printf("Display: BB_MLB_RES %ux%u: %d size table(s), %d frame buffer allocation(s)\n",w,h,found,buffers);
+}
+
 void runtime_display_patch(unsigned char *image, uint64_t image_size) {
+    patch_mlb_table(image,image_size);
     const char *res=getenv("BB_GAME_RES");
     unsigned w=0, h=0;
     if (!res || sscanf(res,"%ux%u",&w,&h)!=2 || w<640 || h<360 || w>7680 || h>4320 || (w==1920 && h==1080)) return;
