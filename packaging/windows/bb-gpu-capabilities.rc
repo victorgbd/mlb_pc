@@ -1,1 +1,4 @@
 1 ICON "../../launcher/mlb.ico"
+#define BB_FILE_DESCRIPTION "GPU capabilities check"
+#define BB_ORIGINAL_NAME "bb-gpu-capabilities.exe"
+#include "version.rc"

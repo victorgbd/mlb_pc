@@ -1,1 +1,4 @@
 1 ICON "../../launcher/mlb.ico"
+#define BB_FILE_DESCRIPTION "Play MLB The Show 24"
+#define BB_ORIGINAL_NAME "Play MLB The Show 24.exe"
+#include "version.rc"

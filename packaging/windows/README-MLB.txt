@@ -54,6 +54,12 @@ Options
 - Advanced page -> Graphics fixes: the crowd textures and the see-through nets are fixes of this
   port; leave them on.
 
+Updates
+- When a new version is out, the launcher shows it in its sidebar when it starts. Update
+  downloads it, closes the launcher, installs it over this folder and opens it again (saves and
+  settings are kept). Nothing is installed without your OK. Settings > Updates turns the check
+  off. Versions before 0.4.0 cannot update themselves: unzip 0.4.0 over them once.
+
 Data
 - Saves and shader caches: user\ next to the launcher (the launcher can pick another folder).
 - Launcher options: %APPDATA%\mlb-launcher. Generated files (prepared game image): out\.

@@ -282,7 +282,7 @@ them.
   native image. fsr.comp now keeps the input alpha. In a match on the GTX 1650: 37 FPS native,
   38 at 1280x720, 41 at 960x540 (the game is CPU-bound there; slower GPUs gain more).
 - Aspect ratio (2026-11-14): `BB_MLB_RES=WxH` (launcher: Display > Aspect ratio: 16:10 1728x1080,
-  21:9 2176x928, 32:9 2688x756) gives the game another size and shape (`src/runtime_display.c`).
+  21:9 2176x928, 32:9 2688x760) gives the game another size and shape (`src/runtime_display.c`).
   MLB's video out setup copies its size from two rodata tables ({1920x1080, 2560x1440, 3200x1800,
   3840x2160} for PS4 Pro, {1280x720, 1920x1080} for base) into the renderer's size globals; the
   renderer, the projection (the view widens, nothing stretches) and the UI layout follow them.
@@ -290,8 +290,24 @@ them.
   `mov edx,0x780; mov ecx,0x438`) are patched. The presenter enlarges the picture to the window.
   `SceneResolution::Native()` makes the render resolution scale the game's size (the launcher
   passes a percentage then; scaled sizes are multiples of 8).
+  Fixed 2026-11-16: the main camera's aspect (camera +0x318) is set from a constant table
+  {16/9, 4/3} (code at 0x81f5, table at 0x207383c), not from the size. The projection follows the
+  size globals, but culling and the SSAO's view reconstruction (camera +0x4f8, tan of the half
+  angles) used 16:9: at 21:9/32:9 the ground pieces at the sides were culled (black bands on the
+  grass next to the dirt and the foul lines) and the 3D view was stretched sideways (players twice
+  as wide at 32:9). The table entry is now w/h. The SSAO chain (Linear Depth Buffer,
+  SSAOOffscreen, AO Buffer 2) is created at a fixed 960x544 and its texel size stored as a constant
+  ({1/960, 1/544}, 0x134993f); both now follow half the size, like ExposureWeightingRT and
+  DownsampledFB (fixed 240x136, now 1/8). The full size fixed targets (ScratchSurface0-2,
+  ZBuffer1920, SubsurfaceRT/Final, spfx, depth, snapshot: `mov esi,0x780; mov edx,0x438` before
+  the create call) stay 1920x1080: resized, the skin turned black.
+  Fixed 2026-11-16: no UI at all in a match (HUD, scoreboard, presentation banners; the frame has
+  no UI passes) when the height is not a multiple of 8: 2688x756 and 2432x810 had none,
+  2688x760, 2560x720, 2176x928 draw it. The 32:9 preset is now 2688x760 and BB_MLB_RES is rounded
+  to multiples of 8 (runtime_display.c and SceneResolution::Native()). Where the game checks it is
+  not known.
   Limit: above a 1920x1088 area of 128x64-aligned pixels (1920x1200, 2240x960, 2208x928 fail;
-  1920x1088, 2176x928, 2688x756, 1728x1080 work) the title screen sends a depth target with
+  1920x1088, 2176x928, 2688x760, 1728x1080 work) the title screen sends a depth target with
   garbage registers (`z_format=2`, pitch 9064) and the GPU stops. Traced so far: the game's
   `setDepthRenderTarget` (0x1cc9d70) copies a valid descriptor from its context (dumped:
   z_info a010200b, size 1920x1200), yet the packet the GPU reads holds other values, and a
