@@ -21,6 +21,7 @@
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
+#include "video_core/renderer_vulkan/vk_fault_service.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/regs.h"
 
@@ -133,7 +134,15 @@ public:
 
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
+        Vulkan::FaultService::context = this;
+        Vulkan::FaultService::serve = [](void* self, bool run_here) {
+            static_cast<Liverpool*>(self)->ServeFaults(run_here);
+        };
     }
+
+    /// GPU command thread, from its wait loops: runs the queued guest write faults (on the draw
+    /// recording thread while draws are in flight, else here).
+    void ServeFaults(bool run_here);
 
     /// bbport: true on the command processor thread (work sent from there must not wait for
     /// itself).
@@ -161,6 +170,24 @@ public:
             ++num_commands;
             submit_cv.notify_one();
         }
+    }
+
+    /// bbport: a guest write fault on a page holding GPU data (BufferCache::InvalidateMemory):
+    /// waits like SendCommand<true>, but while draws are in flight the GPU thread hands it to
+    /// the draw recording thread to run between two draws instead of draining them all first.
+    void SendFaultResolve(auto&& func) {
+        std::binary_semaphore sem{0};
+        {
+            std::scoped_lock lk{submit_mutex};
+            fault_queue.emplace([&sem, &func] {
+                func();
+                sem.release();
+            });
+            ++num_commands;
+            Vulkan::FaultService::pending.fetch_add(1, std::memory_order_release);
+            submit_cv.notify_one();
+        }
+        sem.acquire();
     }
 
     void ReserveCopyBufferSpace() {
@@ -295,6 +322,7 @@ private:
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
+    std::queue<Common::UniqueFunction<void>> fault_queue{}; ///< SendFaultResolve, under submit_mutex
     static inline thread_local bool on_processor_thread = false;
     std::thread::id gpu_id;
 #if defined(__linux__) || defined(_WIN32)

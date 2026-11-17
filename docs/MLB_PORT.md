@@ -343,6 +343,31 @@ them.
   and beyond those at most 512 MiB of layers (`BB_ARRAY_CLAMP=0`: off; the clamped images are
   logged). Peak in a match on the GTX 1650: ~3.5 GB. `BB_VRAM_LOG=1` now also logs every image
   of 64 MiB or more.
+- Frame rate investigation (2026-11-17, i5-10300H + GTX 1650, 16:9, pitching view, ~37-41 FPS,
+  frame pacing median 33 ms at 60 Hz):
+  - The game's main thread waits ~15 ms per frame on a condition variable (BB_WAIT_STATS: "main
+    cond timedwait signaled", once per frame) that the kickCompletion thread broadcasts when its
+    event queue delivers the GPU end-of-pipe interrupt. Main thread work ~10 ms + this wait ->
+    ~25 ms frames.
+  - The EOP does not wait for the GPU (half idle): it is raised once the Vulkan recording thread
+    has recorded up to it. BB_EOP_STATS: submit -> GPU command thread decodes it ~4.1 ms, -> the
+    draw recording thread (stage B) runs it ~5.1 ms, -> the recorder signals it ~3.3 ms (~12.5 ms
+    in all, ~9000 EOPs/s). Stage B spends ~20 us per draw (~600 draws/frame), spread over
+    BindTextures (~12%), GetBarriers, GetSampler, FindImage, BindBuffers, FindView (4-6% each).
+  - Ruled out: guest mutexes (BB_MUTEX_STATS: ~1500 contended/s, ~3.6 ms/s in all), longer spins
+    before stage B / the recorder sleep (BB_PIPE_SPIN_US, BB_RECORDER_SPIN_US), BB_ASYNC_FENCES=1
+    (30 FPS: stage B then waits ~13 ms), disabling any existing pipeline optimization (all slower).
+  - Guest write faults on pages holding GPU data (~250/s) are resolved on the GPU command thread
+    (SendFaultResolve). They waited ~2.3 ms each (the resolve itself ~65 us) because that thread
+    only took commands between packets, not in its wait loops (draw pipe drains, host copy and
+    deferred fence waits: ~55% of its time). Its wait loops now serve them (vk_fault_service.h):
+    in a drain they go to stage B between two draws (DrawPipe::PostPriority), in the other waits
+    the GPU thread runs them itself. ~165 us each now, writers blocked 4% of the time instead of
+    66%; frame rate unchanged (the frame waits for the EOP chain above). BB_FAULTS_ON_STAGE_B=0
+    keeps them off stage B.
+  - Diagnostics: BB_WAIT_STATS=1 (time blocked per guest thread and wait kind, who signals the
+    main thread's condition), BB_EOP_STATS=1, BB_MUTEX_STATS=1, BB_FRAME_STATS (fault resolve
+    wait and run time).
 - Profiling on Windows: guest threads now carry their names as thread descriptions
   (SetThreadDescription), so profilers and debuggers show MainMultiTask, KineCore_MT, ...
   `BB_FRAME_STATS=1` adds "host copy waits" by caller (WaitHostCopies/WaitDeferredSignals;

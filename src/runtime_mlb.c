@@ -38,7 +38,9 @@ typedef struct { int64_t sec, nsec; } GuestTimespec;
 static ABI int32_t posix_nanosleep(const GuestTimespec *request, GuestTimespec *remain) {
     if (!request || request->nsec<0 || request->nsec>=1000000000) { *runtime_errno()=22; return -1; }
     struct timespec t={.tv_sec=(time_t)request->sec,.tv_nsec=(long)request->nsec};
+    const uint64_t ws=runtime_wait_begin();
     nanosleep(&t,NULL);
+    runtime_wait_end("nanosleep",ws);
     if (remain) remain->sec=remain->nsec=0;
     return 0;
 }
@@ -531,7 +533,7 @@ static ABI int32_t audio3d_port_push(uint32_t port, int blocking) {
     uint64_t period=(uint64_t)granule*1000000000u/48000u, now=now_ns();
     uint64_t *next=&audio3d_ports[port].next_push_ns;
     if (*next<now || *next>now+period*8) *next=now;
-    if (blocking && *next>now) { struct timespec t={0,(long)(*next-now)}; nanosleep(&t,NULL); }
+    if (blocking && *next>now) { struct timespec t={0,(long)(*next-now)}; const uint64_t ws=runtime_wait_begin(); nanosleep(&t,NULL); runtime_wait_end("audio3d push",ws); }
     *next+=period; return 0;
 }
 static ABI int32_t audio3d_queue_level(uint32_t port, uint32_t *level, uint32_t *available) {

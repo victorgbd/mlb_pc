@@ -19,10 +19,14 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <vector>
 #include <thread>
 #include <x86intrin.h>
 
 #include "common/assert.h"
+#include "common/unique_function.h"
+#include "video_core/renderer_vulkan/vk_fault_service.h"
 #include "common/thread.h"
 #include "common/types.h"
 
@@ -103,14 +107,18 @@ public:
 
     /// Stage A: waits until stage B has run every committed packet.
     void Drain(u32 reason = ReasonRasterizer) {
-        if (consumed.load(std::memory_order_acquire) == head) {
+        if (consumed.load(std::memory_order_acquire) == head &&
+            prio_pending.load(std::memory_order_acquire) == 0) {
             return;
         }
         ++drains;
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = __rdtsc();
-        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
+        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head ||
+                            prio_pending.load(std::memory_order_acquire) != 0;
+             ++spins) {
+            FaultService::Poll(false);
             if (spins < 4096) {
                 __builtin_ia32_pause();
             } else {
@@ -131,7 +139,23 @@ public:
     }
 
     [[nodiscard]] bool Idle() const noexcept {
-        return consumed.load(std::memory_order_acquire) == head;
+        return consumed.load(std::memory_order_acquire) == head &&
+               prio_pending.load(std::memory_order_acquire) == 0;
+    }
+
+    /// Stage A, while packets are in flight: runs `task` on stage B as soon as it finishes its
+    /// current packet, ahead of the packets still queued (stage B owns the caches then). For work
+    /// whose result does not depend on those packets: a guest write fault on a page holding GPU
+    /// data (BufferCache::InvalidateMemory), which otherwise waited for the whole queue (~2 ms).
+    /// Drain and Idle wait for these tasks too.
+    void PostPriority(Common::UniqueFunction<void>&& task) {
+        {
+            std::scoped_lock lock{prio_mutex};
+            prio_tasks.emplace_back(std::move(task));
+        }
+        prio_pending.fetch_add(1, std::memory_order_seq_cst);
+        wake.fetch_add(1, std::memory_order_seq_cst);
+        wake.notify_one();
     }
 
     /// Statistics (stage A): packets, drains that had to wait, cycles waited, cycles stage B
@@ -179,11 +203,15 @@ private:
                     if (stop.stop_requested()) {
                         return;
                     }
+                    if (prio_pending.load(std::memory_order_acquire) != 0) {
+                        RunPriority();
+                    }
                     __builtin_ia32_pause();
                     if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
                         const u32 seen = wake.load(std::memory_order_seq_cst);
                         sleeping.store(true, std::memory_order_seq_cst);
                         if (published.load(std::memory_order_seq_cst) == at &&
+                            prio_pending.load(std::memory_order_seq_cst) == 0 &&
                             !stop.stop_requested()) {
                             wake.wait(seen, std::memory_order_seq_cst);
                         }
@@ -203,7 +231,22 @@ private:
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
             at += header->size;
             consumed.store(at, std::memory_order_release);
+            if (prio_pending.load(std::memory_order_acquire) != 0) {
+                RunPriority();
+            }
         }
+    }
+
+    void RunPriority() {
+        std::vector<Common::UniqueFunction<void>> tasks;
+        {
+            std::scoped_lock lock{prio_mutex};
+            tasks.swap(prio_tasks);
+        }
+        for (auto& task : tasks) {
+            task();
+        }
+        prio_pending.fetch_sub(static_cast<u32>(tasks.size()), std::memory_order_release);
     }
 
     static inline thread_local bool on_stage_b = false;
@@ -216,6 +259,9 @@ private:
     alignas(64) std::atomic<u64> consumed{0};
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
+    std::mutex prio_mutex;
+    std::vector<Common::UniqueFunction<void>> prio_tasks;
+    alignas(64) std::atomic<u32> prio_pending{0};
     std::atomic<u32> stage_b_tid{0};
     std::jthread thread;
 };

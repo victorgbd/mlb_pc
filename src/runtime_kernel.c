@@ -108,7 +108,9 @@ uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
 static int sleep_ns(uint64_t ns) {
 #ifdef _WIN32
+    const uint64_t ws=runtime_wait_begin();
     compat_sleep_ns(ns);
+    runtime_wait_end(ns<1000000 ? "sleep <1ms" : "sleep >=1ms",ws);
 #else
     struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)};
     while (nanosleep(&t,&t)) if (errno!=EINTR) return errno;

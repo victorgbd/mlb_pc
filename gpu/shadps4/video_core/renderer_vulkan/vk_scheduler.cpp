@@ -15,6 +15,7 @@
 #include <functional>
 
 #include "bbport_copy.h"
+#include "video_core/renderer_vulkan/vk_fault_service.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/landing_gate.h"
 #include "bbport_toggles.h"
@@ -289,6 +290,8 @@ void Scheduler::WaitDeferredSignals() {
         if (VideoCore::LandingGate::Stopped()) {
             break; // shutdown: the labels waiting on the landing thread were dropped
         }
+        // Guest write faults waiting meanwhile (vk_fault_service.h).
+        FaultService::Poll(true);
         // Helps the copy threads the signals wait for.
         BbCopy::WaitAsync();
         std::this_thread::yield();
@@ -301,6 +304,7 @@ void Scheduler::WaitHostCopies() {
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+            FaultService::Poll(true);
             std::this_thread::yield();
         }
     }
@@ -360,8 +364,13 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
         // hardware threads (Steam Deck: 8) the spin would take time from guest threads.
-        static const auto spin_time = std::chrono::microseconds(
-            BbThreads::Available() >= 12 ? 200 : 20);
+        // BB_RECORDER_SPIN_US overrides.
+        static const auto spin_time = std::chrono::microseconds([] {
+            if (const char* env = std::getenv("BB_RECORDER_SPIN_US")) {
+                return std::max(0, std::atoi(env));
+            }
+            return BbThreads::Available() >= 12 ? 200 : 20;
+        }());
         const auto spin_until = std::chrono::steady_clock::now() + spin_time;
         for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
             __builtin_ia32_pause();

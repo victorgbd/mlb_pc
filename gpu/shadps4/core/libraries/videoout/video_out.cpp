@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_waitstats.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -372,6 +373,7 @@ s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
 }
 
 s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
+    const BbWaitScope wait_scope{"vblank"};
     auto* port = driver->GetPort(handle);
     if (!port) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
