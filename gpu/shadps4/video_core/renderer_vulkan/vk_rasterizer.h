@@ -90,10 +90,9 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).
-    void WaitHostCopies() {
-        DrainDrawPipe();
-        scheduler.WaitHostCopies();
-    }
+    /// `line`/`function`: the caller, for the statistics of where the GPU thread waits for
+    /// host copies (BB_FRAME_STATS).
+    void WaitHostCopies(u32 line = __builtin_LINE(), const char* function = __builtin_FUNCTION());
 
     /// bbport: GPU command thread: waits until the draw recording thread has recorded every
     /// draw handed to it (vk_draw_pipe.h); no-op on other threads.
@@ -135,10 +134,8 @@ public:
     bool NoteCopy64Readback(const Shader::Info& stage);
     void ReadBackSmallWrittenBuffers();
     /// Before a guest-visible write: fences deferred earlier are written first.
-    void WaitDeferredSignals() {
-        scheduler.WaitDeferredSignals();
-    }
-    /// Runs `signal` after the guest memory copies issued so far, without waiting here.
+    void WaitDeferredSignals(u32 line = __builtin_LINE(),
+                             const char* function = __builtin_FUNCTION());    /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0,
                                bool off_recorder = false) {
         scheduler.SignalAfterHostCopies(std::move(signal), landing_seq, off_recorder);

@@ -247,8 +247,12 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         const char* env = std::getenv("BB_IMAGE_LOG");
         return env && env[0] == '1';
     }();
-    if (image_log) {
-        std::printf("Image 0x%llx: %ux%ux%u %s guest 0x%llx+0x%llx mips %u layers %u samples %u "
+    // BB_VRAM_LOG=1: the images of 64 MiB and more (what fills a small card).
+    if (image_log || (Vulkan::Vram::Log() && backing->image.size_bytes >= (64ull << 20))) {
+        std::printf("Image 0x%llx (%llu MiB):", static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(static_cast<VkImage>(GetImage()))),
+                    static_cast<unsigned long long>(backing->image.size_bytes >> 20));
+        std::printf(" Image 0x%llx: %ux%ux%u %s guest 0x%llx+0x%llx mips %u layers %u samples %u "
                     "tile %s usage %s host 0x%llx bytes\n",
                     static_cast<unsigned long long>(
                         reinterpret_cast<uintptr_t>(static_cast<VkImage>(GetImage()))),

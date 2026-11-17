@@ -576,6 +576,9 @@ bool Rasterizer::OnStageA() const {
 namespace {
 /// Stage A: cycles waited per drain site (BB_FRAME_STATS), keyed by function name and line.
 std::unordered_map<const char*, std::unordered_map<u32, u64>> drain_sites;
+/// Cycles and calls spent in WaitHostCopies per caller (BB_FRAME_STATS).
+std::mutex host_wait_sites_mutex;
+std::unordered_map<const char*, std::unordered_map<u32, std::pair<u64, u64>>> host_wait_sites;
 } // namespace
 
 void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
@@ -1018,6 +1021,39 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     }
 }
 
+void Rasterizer::WaitHostCopies(u32 line, const char* function) {
+    DrainDrawPipe(DrawPipe::ReasonRasterizer, line, function);
+    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
+    if (!stats) {
+        scheduler.WaitHostCopies();
+        return;
+    }
+    const u64 start = __rdtsc();
+    scheduler.WaitHostCopies();
+    const u64 waited = __rdtsc() - start;
+    std::scoped_lock lock{host_wait_sites_mutex};
+    auto& site = host_wait_sites[function][line];
+    site.first += waited;
+    ++site.second;
+}
+
+void Rasterizer::WaitDeferredSignals(u32 line, const char* function) {
+    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
+    if (!stats) {
+        scheduler.WaitDeferredSignals();
+        return;
+    }
+    const u64 start = __rdtsc();
+    scheduler.WaitDeferredSignals();
+    const u64 waited = __rdtsc() - start;
+    // Line + 100000 on the draw recording thread, + 200000 elsewhere off stage A.
+    const u32 key = line + (DrawPipe::OnStageB() ? 100000 : OnStageA() ? 0 : 200000);
+    std::scoped_lock lock{host_wait_sites_mutex};
+    auto& site = host_wait_sites[function][key];
+    site.first += waited;
+    ++site.second;
+}
+
 void Rasterizer::PrintPipeStats() {
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     if (!stats || (draw_pipe->packets & 1023) != 0) {
@@ -1063,6 +1099,19 @@ void Rasterizer::PrintPipeStats() {
                 std::printf(" %s:%u %.1f%%", function, line, 100.0 * waited / cycles);
             }
         }
+    }
+    std::printf("\n  host copy waits over 0.5%%:");
+    {
+        std::scoped_lock lock{host_wait_sites_mutex};
+        for (const auto& [function, lines] : host_wait_sites) {
+            for (const auto& [line, site] : lines) {
+                if (site.first * 200 > cycles) {
+                    std::printf(" %s:%u %.1f%% (%.0f/s)", function, line,
+                                100.0 * site.first / cycles, site.second / seconds);
+                }
+            }
+        }
+        host_wait_sites.clear();
     }
     std::printf("\n");
     drain_sites.clear();

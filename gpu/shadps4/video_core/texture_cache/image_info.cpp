@@ -141,6 +141,39 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     guest_address = image.Address();
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
+    // bbport: array T#s with an absurd layer count. MLB binds (in some match presentations) a
+    // 1024x512 BC1 array whose depth field says 8192 layers: 2.7 GiB on the host, more than a
+    // 4 GB card holds (ErrorOutOfDeviceMemory, the game stops), and its 32-bit guest size wraps.
+    // The image keeps the slices its view reaches (last_array) when that is far fewer, and beyond
+    // those at most 512 MiB of layers; a later T# that reaches further gets a larger image.
+    // BB_ARRAY_CLAMP=0: off.
+    static const bool clamp_arrays = [] {
+        const char* env = std::getenv("BB_ARRAY_CLAMP");
+        return !(env && env[0] == '0');
+    }();
+    if (clamp_arrays && !props.is_volume && !image.IsCube() && resources.layers > 64) {
+        const u32 declared = resources.layers;
+        resources.layers = 1;
+        UpdateSize();
+        const u64 layer_bytes = std::max<u64>(guest_size, 1);
+        u32 layers = static_cast<u32>(std::min<u64>(declared, std::max<u64>(1, (512ull << 20) / layer_bytes)));
+        const u32 reached = std::max<u32>(image.last_array + 1, 1);
+        if (reached * 4 < declared) {
+            layers = std::min(layers, reached);
+        }
+        // Never fewer than the view reaches.
+        layers = std::max(layers, std::min(reached, declared));
+        resources.layers = layers;
+        if (layers != declared) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::printf("Texture cache: %ux%u array at 0x%llx declares %u layers (view up to %u, "
+                            "%llu KiB each): sized for %u\n",
+                            size.width, size.height, static_cast<unsigned long long>(image.Address()),
+                            declared, reached, static_cast<unsigned long long>(layer_bytes >> 10), layers);
+            }
+        }
+    }
     UpdateSize();
 }
 
