@@ -104,20 +104,72 @@ void Liverpool::ProcessCommands() {
     if (!num_commands) {
         return;
     }
-    if (rasterizer) {
-        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
-    }
-    // Process incoming commands with high priority
+    // Process incoming commands with high priority. Guest write faults on GPU data
+    // (SendFaultResolve) go to the draw recording thread between two draws while draws are in
+    // flight, so the writing game thread does not wait for them all; other commands, and faults
+    // when the pipe is idle, run here after a drain. Each pass takes one item of either queue
+    // under the lock (num_commands counts both, and either can grow meanwhile).
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
+        bool fault = false;
         {
             std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
-            command_queue.pop();
+            if (!fault_queue.empty()) {
+                callback = std::move(fault_queue.front());
+                fault_queue.pop();
+                fault = true;
+                Vulkan::FaultService::pending.fetch_sub(1, std::memory_order_release);
+            } else if (!command_queue.empty()) {
+                callback = std::move(command_queue.front());
+                command_queue.pop();
+            } else {
+                break;
+            }
             --num_commands;
+        }
+        if (fault && rasterizer && rasterizer->PostToStageB(callback)) {
+            continue;
+        }
+        if (rasterizer) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
         }
         callback();
     }
+}
+
+void Liverpool::ServeFaults(bool run_here) {
+    static thread_local bool serving = false;
+    if (!on_processor_thread || serving || !rasterizer) {
+        return;
+    }
+    serving = true;
+    while (true) {
+        Common::UniqueFunction<void> fault{};
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (fault_queue.empty()) {
+                break;
+            }
+            fault = std::move(fault_queue.front());
+            fault_queue.pop();
+            --num_commands;
+            Vulkan::FaultService::pending.fetch_sub(1, std::memory_order_release);
+        }
+        if (rasterizer->PostToStageB(fault)) {
+            continue;
+        }
+        if (run_here && rasterizer->DrawPipeIdle()) {
+            fault();
+            continue;
+        }
+        // Neither: back to the queue for the next ProcessCommands.
+        std::scoped_lock lk{submit_mutex};
+        fault_queue.push(std::move(fault));
+        ++num_commands;
+        Vulkan::FaultService::pending.fetch_add(1, std::memory_order_release);
+        break;
+    }
+    serving = false;
 }
 
 void Liverpool::Process(std::stop_token stoken) {
@@ -270,6 +322,73 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
 } // namespace
 
 namespace {
+// bbport diagnosis (BB_EOP_STATS=1): latency of graphics end-of-pipe events, the game's "GPU done"
+// signal, split into: submitted -> the GPU command thread decodes the packet (a), -> the packet
+// runs in order (on the draw recording thread; b), -> the fence and interrupt (on the Vulkan
+// recording thread after the copies queued before; c). EOPs keep their order through the stages,
+// so each stage numbers them.
+namespace EopStats {
+static bool On() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_EOP_STATS");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+static u64 Now() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+static constexpr u32 Ring = 1024;
+static u64 t0[Ring], t1[Ring], t2[Ring];
+static std::atomic<u64> seq_a{0}, seq_b{0};
+static std::atomic<u64> dcb_submit_ns{0}; ///< submission time of the buffer being decoded
+static std::mutex submit_mutex;
+static std::deque<u64> submit_times;
+static std::atomic<u64> sum_a{0}, sum_b{0}, sum_c{0}, count{0}, window{0};
+static void Submitted() {
+    std::scoped_lock lock{submit_mutex};
+    submit_times.push_back(Now());
+}
+static void DecodeStarts() {
+    std::scoped_lock lock{submit_mutex};
+    if (!submit_times.empty()) {
+        dcb_submit_ns = submit_times.front();
+        submit_times.pop_front();
+    }
+}
+static void Decoded() {
+    const u64 i = seq_a.fetch_add(1) % Ring;
+    t0[i] = dcb_submit_ns.load();
+    t1[i] = Now();
+}
+static u64 Runs() {
+    const u64 b = seq_b.fetch_add(1);
+    t2[b % Ring] = Now();
+    return b;
+}
+static void Signalled(u64 b) {
+    const u32 i = b % Ring;
+    const u64 now = Now();
+    sum_a += t1[i] - std::min(t0[i], t1[i]);
+    sum_b += t2[i] - t1[i];
+    sum_c += now - t2[i];
+    const u64 n = ++count;
+    u64 w = window.load();
+    if (!w) {
+        window.compare_exchange_strong(w, now);
+    } else if (now - w >= 5'000'000'000ull && window.compare_exchange_strong(w, now)) {
+        const u64 a = sum_a.exchange(0), bb = sum_b.exchange(0), c = sum_c.exchange(0);
+        count = 0;
+        std::printf("EOP latency (%llu events, %.0f/s): submit->decoded %.2f ms, ->run in order "
+                    "%.2f ms, ->signalled %.2f ms (total %.2f ms)\n",
+                    static_cast<unsigned long long>(n), n / ((now - w) / 1e9), a / 1e6 / n,
+                    bb / 1e6 / n, c / 1e6 / n, (a + bb + c) / 1e6 / n);
+    }
+}
+} // namespace EopStats
+
 void SignalEop(const PM4CmdEventWriteEop& eop) {
     eop.SignalFence(
         [](void* address, u64 data, u32 num_bytes) {
@@ -286,6 +405,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 // the draw recording thread when the draw pipeline is in use).
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
+    const u64 eop_b = EopStats::On() ? EopStats::Runs() : ~0ull;
     // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
     u64 landing_seq = VideoCore::LandingGate::Pending();
     rasterizer.ProcessDownloadImages();
@@ -321,17 +441,26 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     }();
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
         VideoCore::LandingGate::Wait(landing_seq);
-        BbCopy::AfterCopies([eop] { SignalEop(eop); });
+        BbCopy::AfterCopies([eop, eop_b] {
+            SignalEop(eop);
+            if (eop_b != ~0ull) EopStats::Signalled(eop_b);
+        });
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
         // The draw recording thread does not wait: the Vulkan recording thread signals the
         // fence after the copies queued before it.
-        rasterizer.SignalAfterHostCopies([eop] { SignalEop(eop); }, landing_seq);
+        rasterizer.SignalAfterHostCopies(
+            [eop, eop_b] {
+                SignalEop(eop);
+                if (eop_b != ~0ull) EopStats::Signalled(eop_b);
+            },
+            landing_seq);
     } else {
         // Labels are written in order: not before the ones deferred to the recording thread.
         rasterizer.WaitHostCopies();
         rasterizer.WaitDeferredSignals();
         VideoCore::LandingGate::Wait(landing_seq);
         SignalEop(eop);
+        if (eop_b != ~0ull) EopStats::Signalled(eop_b);
     }
 }
 
@@ -823,6 +952,9 @@ void ScanDcb(std::span<const u32> dcb, int depth) {
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
                                            u64 seq) {
     FIBER_ENTER(dcb_task_name);
+    if (EopStats::On()) {
+        EopStats::DecodeStarts();
+    }
     // Top-level buffers enqueued for the draw preparation workers (nested IBs are not).
     Vulkan::DrawPreparation* draw_prep =
         seq != NoSeq && rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
@@ -1261,6 +1393,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 if (rasterizer) {
+                    if (EopStats::On()) {
+                        EopStats::Decoded();
+                    }
                     if (rasterizer->RunInOrder(&RunEventWriteEop, event_eop, sizeof(*event_eop))) {
                         NotePendingFences(*event_eop);
                     }
@@ -1813,6 +1948,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         if (draw_prep) {
             seq = gfx_submit_seq++;
             draw_prep->Enqueue(seq, std::move(prep_submission));
+        }
+        if (EopStats::On()) {
+            EopStats::Submitted();
         }
         auto task = ProcessGraphics(dcb, ccb, seq);
         queue.submits.emplace(task.handle);

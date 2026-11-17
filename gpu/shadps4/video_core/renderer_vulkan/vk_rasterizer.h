@@ -97,6 +97,11 @@ public:
     /// bbport: GPU command thread: waits until the draw recording thread has recorded every
     /// draw handed to it (vk_draw_pipe.h); no-op on other threads.
     /// `line`/`function`: the caller, for the statistics of where stage A waits.
+    /// bbport: GPU command thread: hands `task` to the draw recording thread to run between two
+    /// draws when draws are in flight (DrawPipe::PostPriority) and returns true; false (task left
+    /// untouched) when the pipe is idle or off: the caller runs it after a drain as before.
+    /// BB_FAULTS_ON_STAGE_B=0: always false.
+    bool PostToStageB(Common::UniqueFunction<void>& task);
     void DrainDrawPipe(u32 reason = DrawPipe::ReasonRasterizer, u32 line = __builtin_LINE(),
                        const char* function = __builtin_FUNCTION());
     /// Runs `task(rasterizer, copy of data)` in order with the draws: on the draw recording

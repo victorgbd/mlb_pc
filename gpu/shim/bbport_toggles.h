@@ -89,6 +89,8 @@ inline std::atomic<std::uint64_t> dead_gpu_drops{0}, gpu_read_backs{0};
 inline std::atomic<std::uint64_t> gpu_merges{0};
 /// ... or read back on the second queue (GPU work done; BufferCache::DownloadOnSideQueue).
 inline std::atomic<std::uint64_t> gpu_side_downloads{0}, gpu_side_download_ns{0};
+/// Guest writes resolved on the GPU thread: how many, the writer's total wait, the resolve time.
+inline std::atomic<std::uint64_t> fault_resolves{0}, fault_resolve_wait_ns{0}, fault_resolve_run_ns{0};
 inline std::atomic<std::int64_t> hot_pages{0};
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};

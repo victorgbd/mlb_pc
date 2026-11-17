@@ -856,6 +856,17 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
         const u64 length = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE) - page;
         // Decided on the GPU thread, where GPU writes are recorded: none can come in between.
         auto resolve = [this, page, length, device_addr, size] {
+            const auto run_start = std::chrono::steady_clock::now();
+            const auto note_run = [run_start] {
+                BbStats::fault_resolve_run_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - run_start).count(),
+                    std::memory_order_relaxed);
+            };
+            struct RunTimer {
+                decltype(note_run)& f;
+                ~RunTimer() { f(); }
+            } run_timer{note_run};
             const u32 frames = g_guest_frames.load(std::memory_order_relaxed);
             const u32 gpu_write = memory_tracker->LatestGpuWriteFrame(page, length);
             const u32 gpu_use = LastGpuUse(page, length);
@@ -889,7 +900,13 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
         if (assume_locks) {
             resolve();
         } else {
-            liverpool->SendCommand<true>(std::move(resolve));
+            const auto wait_start = std::chrono::steady_clock::now();
+            liverpool->SendFaultResolve(std::move(resolve));
+            BbStats::fault_resolves.fetch_add(1, std::memory_order_relaxed);
+            BbStats::fault_resolve_wait_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count(),
+                std::memory_order_relaxed);
         }
     });
 }

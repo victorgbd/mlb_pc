@@ -468,6 +468,14 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            if (const u64 resolves = BbStats::fault_resolves.exchange(0)) {
+                std::printf("Fault resolves on the GPU thread: %.0f/s, writer waited %.1f%% of the "
+                            "time (%.0f us each), resolving %.0f us each\n",
+                            resolves / window,
+                            BbStats::fault_resolve_wait_ns.load() / (window * 1e7),
+                            BbStats::fault_resolve_wait_ns.exchange(0) / 1e3 / resolves,
+                            BbStats::fault_resolve_run_ns.exchange(0) / 1e3 / resolves);
+            }
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
                 std::vector<double> sorted = intervals;

@@ -562,6 +562,18 @@ bool Rasterizer::UseDrawPipe() const {
     return draw_pipe && !host_markers_enabled && !BbToggle::Disabled(BbToggle::DrawPipeline);
 }
 
+bool Rasterizer::PostToStageB(Common::UniqueFunction<void>& task) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_FAULTS_ON_STAGE_B");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || !UseDrawPipe() || !OnStageA() || draw_pipe->Idle()) {
+        return false;
+    }
+    draw_pipe->PostPriority(std::move(task));
+    return true;
+}
+
 bool Rasterizer::OnStageA() const {
 #ifdef _WIN32
     // bbport (Windows): libc++ compares std::thread::id through winpthreads' pthread_equal,

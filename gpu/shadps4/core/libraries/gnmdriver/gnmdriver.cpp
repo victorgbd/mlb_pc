@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_waitstats.h"
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -86,6 +87,7 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 }
 
 static void WaitGpuIdle() {
+    const BbWaitScope wait_scope{"gnm submission lock"};
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
@@ -2378,6 +2380,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
+    const BbWaitScope wait_scope{"gnm submit done"};
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
     if (!liverpool->IsGpuIdle()) {

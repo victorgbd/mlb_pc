@@ -106,6 +106,9 @@ uintptr_t runtime_fiber_resolve(const char *name);
 void runtime_fiber_report(void);
 /* For fault reports (no allocation, any thread): the guest thread and fiber running here, or NULL. */
 const char *runtime_thread_name_here(void);
+/* BB_WAIT_STATS=1: time blocked per thread and kind (runtime_waitstats.c). begin returns 0 when off. */
+uint64_t runtime_wait_begin(void);
+void runtime_wait_end(const char *kind, uint64_t start);
 const char *runtime_fiber_name_here(void);
 /* Host functions the loader runs at the start of matching guest functions (probe.c). The guest
  * code is found by `pattern`, not by a fixed address, so every build of a game is covered that

@@ -77,10 +77,44 @@ static int32_t ensure_mutex(GuestMutex **mutex) {
     pthread_mutex_unlock(&static_init);
     return e;
 }
+/* BB_MUTEX_STATS=1 (diagnosis): contended guest mutex locks and the time spent waiting, every 5 s. */
+static int mutex_stats=-1;
+static uint64_t stat_locks, stat_contended, stat_wait_ns, stat_max_ns, stat_last_ns;
+static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
+static void note_lock(uint64_t waited) {
+    __atomic_add_fetch(&stat_locks,1,__ATOMIC_RELAXED);
+    if (waited) {
+        __atomic_add_fetch(&stat_contended,1,__ATOMIC_RELAXED);
+        __atomic_add_fetch(&stat_wait_ns,waited,__ATOMIC_RELAXED);
+        uint64_t m=__atomic_load_n(&stat_max_ns,__ATOMIC_RELAXED);
+        while (waited>m && !__atomic_compare_exchange_n(&stat_max_ns,&m,waited,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+    }
+    const uint64_t now=now_ns(), last=__atomic_load_n(&stat_last_ns,__ATOMIC_RELAXED);
+    if (!last) { __atomic_store_n(&stat_last_ns,now,__ATOMIC_RELAXED); return; }
+    if (now-last<5000000000ull || !__atomic_compare_exchange_n(&stat_last_ns,(uint64_t[]){last},now,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) return;
+    const double s=(double)(now-last)/1e9;
+    const uint64_t n=__atomic_exchange_n(&stat_locks,0,__ATOMIC_RELAXED), c=__atomic_exchange_n(&stat_contended,0,__ATOMIC_RELAXED),
+                   w=__atomic_exchange_n(&stat_wait_ns,0,__ATOMIC_RELAXED), mx=__atomic_exchange_n(&stat_max_ns,0,__ATOMIC_RELAXED);
+    printf("Guest mutexes: %.0f locks/s, %.0f contended/s, waiting %.1f ms/s in all (%.1f us each, max %.1f ms)\n",
+           n/s,c/s,w/1e6/s,c?w/1e3/c:0.0,mx/1e6);
+}
 static ABI int32_t mutex_lock(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
-    e = orbis_error(pthread_mutex_lock(&(*mutex)->native));
+    if (mutex_stats<0) { const char *env=getenv("BB_MUTEX_STATS"); mutex_stats=env && env[0]=='1'; }
+    if (mutex_stats) {
+        int t=pthread_mutex_trylock(&(*mutex)->native);
+        if (t==EBUSY) {
+            const uint64_t start=now_ns();
+            e = orbis_error(pthread_mutex_lock(&(*mutex)->native));
+            note_lock(now_ns()-start);
+        } else {
+            e = orbis_error(t);
+            note_lock(0);
+        }
+    } else {
+        e = orbis_error(pthread_mutex_lock(&(*mutex)->native));
+    }
     if (!e) ++locks;
     return e;
 }
@@ -125,6 +159,7 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
 /* Condition variables: opaque handles over host pthread_cond (CLOCK_REALTIME,
  * like FreeBSD's default), sharing the host mutex behind GuestMutex. */
 typedef struct { pthread_cond_t native; } GuestCond;
+static GuestCond *main_cond; /* BB_WAIT_STATS: the condition the main thread last waited on */
 static size_t conds, waits, wakeups;
 static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
     (void)attr; (void)name;
@@ -160,14 +195,23 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     ++waits;
-    return orbis_error(pthread_cond_wait(&(*cond)->native, &(*mutex)->native));
+    const uint64_t ws = runtime_wait_begin();
+    e = orbis_error(pthread_cond_wait(&(*cond)->native, &(*mutex)->native));
+    runtime_wait_end("cond wait", ws);
+    return e;
 }
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
-    return timed_error(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
+    const uint64_t ws = runtime_wait_begin();
+    const char *me = ws ? runtime_thread_name_here() : NULL;
+    const int is_main = me && !strcmp(me, "main");
+    if (is_main) __atomic_store_n(&main_cond, *cond, __ATOMIC_RELAXED);
+    e = timed_error(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
+    runtime_wait_end(is_main ? (e ? "cond timedwait TIMEOUT" : "cond timedwait signaled") : "cond timedwait", ws);
+    return e;
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
     struct timespec end;
@@ -177,11 +221,13 @@ static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
+    if (*cond == __atomic_load_n(&main_cond, __ATOMIC_RELAXED)) { const uint64_t ws = runtime_wait_begin(); runtime_wait_end(">signals main's cond", ws); }
     ++wakeups; return orbis_error(pthread_cond_signal(&(*cond)->native));
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
+    if (*cond == __atomic_load_n(&main_cond, __ATOMIC_RELAXED)) { const uint64_t ws = runtime_wait_begin(); runtime_wait_end(">broadcasts main's cond", ws); }
     ++wakeups; return orbis_error(pthread_cond_broadcast(&(*cond)->native));
 }
 /* Wakes one given thread: waking every waiter is allowed (spurious wakeups) and needs no thread list. */
