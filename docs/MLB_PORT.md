@@ -334,3 +334,16 @@ them.
     generated frames separately.
 - Game speed on a 4-core laptop (i5-10300H): about 30 FPS in a game, limited by the GPU command
   processor thread (87% of a core) while the GPU is half idle.
+- Video memory (fixed 2026-11-17): MLB declares 8192 layers (the T# depth field at its maximum)
+  on many 2D array textures whose views reach one slice, and on a 1024x512 BC1 array whose views
+  reach 134. Created as declared, that one image took 2.7 GiB (its 32-bit guest size wrapped), so
+  in some match presentations (PresFanCam) the process went to 6.5-8.7 GB and a 4 GB card failed
+  an allocation (`Failed allocating image with error ErrorOutOfDeviceMemory`, the game stops).
+  `ImageInfo` (T#) now keeps the slices the view reaches when that is far fewer than declared,
+  and beyond those at most 512 MiB of layers (`BB_ARRAY_CLAMP=0`: off; the clamped images are
+  logged). Peak in a match on the GTX 1650: ~3.5 GB. `BB_VRAM_LOG=1` now also logs every image
+  of 64 MiB or more.
+- Profiling on Windows: guest threads now carry their names as thread descriptions
+  (SetThreadDescription), so profilers and debuggers show MainMultiTask, KineCore_MT, ...
+  `BB_FRAME_STATS=1` adds "host copy waits" by caller (WaitHostCopies/WaitDeferredSignals;
+  +100000 on the line: on the draw recording thread).
