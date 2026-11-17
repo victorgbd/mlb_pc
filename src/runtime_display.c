@@ -132,12 +132,15 @@ static int patch_movie_slots(unsigned char *image, uint64_t image_size, uint32_t
  * call), which is patched too.
  * Limit: above a 1920x1088 area of 128x64-aligned pixels the title screen draws with a depth target
  * whose registers are garbage (z_format 2) and the GPU stops; that memory has not been found, so
- * larger sizes are refused. */
+ * larger sizes are refused.
+ * The UI (HUD, scoreboard, presentation banners) is not drawn at all in a match when the height is
+ * not a multiple of 8 (2688x756 and 2432x810 had none; 2688x760, 2560x720, 2176x928 do), so both
+ * sides are rounded to the nearest multiple of 8. */
 static void patch_mlb_table(unsigned char *image, uint64_t image_size) {
     const char *res=getenv("BB_MLB_RES");
     unsigned w=0, h=0;
     if (!res || sscanf(res,"%ux%u",&w,&h)!=2) return;
-    w&=~1u; h&=~1u;
+    w=(w+4)&~7u; h=(h+4)&~7u;
     if (w==1920 && h==1080) return;
     const uint64_t area=(uint64_t)((w+127)&~127u)*((h+63)&~63u);
     if (w<640 || h<360 || area>UINT64_C(1920)*1088) {
@@ -158,7 +161,50 @@ static void patch_mlb_table(unsigned char *image, uint64_t image_size) {
         if (memcmp(image+i,fb,sizeof(fb))) continue;
         put32(image+i+1,w); put32(image+i+6,h); ++buffers;
     }
-    printf("Display: BB_MLB_RES %ux%u: %d size table(s), %d frame buffer allocation(s)\n",w,h,found,buffers);
+    /* The main camera's aspect ratio (camera +0x318) comes from a constant table {16/9, 4/3}
+       (lea rcx,[table]; vmovss xmm0,[rcx+rdx*4]), not from the size. The picture follows the size
+       globals, but culling and the SSAO's view reconstruction used this aspect: at a wider size the
+       ground pieces at the sides were culled (black bands on the field) and the 3D view was
+       stretched sideways. */
+    int aspect=0;
+    {
+        static const uint32_t table[2]={0x3fe38e39,0x3faaaaab};
+        const float value=(float)w/(float)h;
+        for (uint64_t i=0;i+sizeof(table)<=image_size;i+=4) {
+            if (memcmp(image+i,table,sizeof(table))) continue;
+            memcpy(image+i,&value,4); ++aspect;
+        }
+    }
+    /* Render targets created with a fixed fraction of 1920x1080 instead of the size globals
+       (mov esi,W; mov edx,H before the create call): half size 960x544 (the SSAO chain: Linear Depth
+       Buffer, SSAOOffscreen, AO Buffer 2) and 1/8 size 240x136 (ExposureWeightingRT, DownsampledFB).
+       The SSAO setup also stores their texel size as a constant pair (movabs rax, {1/960, 1/544}).
+       The full size ones (ScratchSurface0-2, ZBuffer1920, SubsurfaceRT/Final, spfx, depth, snapshot)
+       stay 1920x1080: resized, the skin (subsurface) turned black. */
+    const unsigned half_w=((w+1)/2+15)&~15u, half_h=((h+1)/2+15)&~15u;
+    const unsigned eighth_w=((w+7)/8+7)&~7u, eighth_h=((h+7)/8+7)&~7u;
+    const struct { uint32_t w, h, new_w, new_h; } sizes[]={{960,544,half_w,half_h}, {240,136,eighth_w,eighth_h}};
+    int targets=0;
+    for (size_t s=0;s<sizeof(sizes)/sizeof(sizes[0]);++s) {
+        for (uint64_t i=0;i+10<=image_size;++i) {
+            unsigned char *p=image+i;
+            if (p[0]==0xbe && get32(p+1)==sizes[s].w && p[5]==0xba && get32(p+6)==sizes[s].h) {
+                put32(p+1,sizes[s].new_w); put32(p+6,sizes[s].new_h); ++targets; i+=9;
+            }
+        }
+    }
+    int texel=0;
+    {
+        const float inv[2]={1.0f/(float)half_w,1.0f/(float)half_h};
+        static const unsigned char old[10]={0x48,0xb8,0x89,0x88,0x88,0x3a,0xf1,0xf0,0xf0,0x3a};
+        for (uint64_t i=0;i+sizeof(old)<=image_size;++i) {
+            if (memcmp(image+i,old,sizeof(old))) continue;
+            memcpy(image+i+2,inv,8); ++texel;
+        }
+    }
+    printf("Display: BB_MLB_RES %ux%u: %d size table(s), %d frame buffer allocation(s), %d camera aspect(s), "
+           "%d reduced render targets (half %ux%u), %d SSAO texel size(s)\n",w,h,found,buffers,aspect,targets,
+           half_w,half_h,texel);
 }
 
 void runtime_display_patch(unsigned char *image, uint64_t image_size) {

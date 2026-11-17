@@ -41,10 +41,22 @@ CONFIG_FILE = CONFIG_DIR / 'settings.json'
 NAME = 'MLB The Show 24'
 EXE_NAME = 'MLB The Show 24.exe'
 AUTHOR = 'victorgbd'
-# This build; GitHub release tags are v<VERSION> (their digits are compared).
-VERSION = '0.1.0'
+
+
+def read_version():
+    """This build's version: the VERSION file at the repository root, bundled into the frozen launcher.
+    GitHub release tags are v<VERSION> (their digits are compared)."""
+    for folder in (Path(getattr(sys, '_MEIPASS', PORT_DIR)), PORT_DIR):
+        try:
+            return (folder / 'VERSION').read_text(encoding='utf-8').strip() or '0'
+        except OSError:
+            pass
+    return '0'
+
+
+VERSION = read_version()
 # "owner/repository" on GitHub whose releases hold the packaged zip. Empty: no update check.
-RELEASES_REPO = ''
+RELEASES_REPO = 'victorgbd/mlb_pc'
 RELEASES_API = f'https://api.github.com/repos/{RELEASES_REPO}/releases/latest' if RELEASES_REPO else ''
 RELEASES_PAGE = f'https://github.com/{RELEASES_REPO}/releases/latest' if RELEASES_REPO else ''
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'mlb-update'
@@ -79,8 +91,8 @@ WINDOW_SIZES = [('1280x720', '1280 × 720'), ('1600x900', '1600 × 900'),
 # The game's own size for another picture shape (BB_MLB_RES, src/runtime_display.c): at most a
 # 1920x1088 area of 128x64-aligned pixels (the game stops above it), enlarged by the presenter.
 ASPECTS = [('16:9', '16:9 (1920 × 1080)'), ('16:10', '16:10 (1728 × 1080)'),
-           ('21:9', '21:9 (2176 × 928)'), ('32:9', '32:9 (2688 × 756)')]
-ASPECT_SIZES = {'16:10': '1728x1080', '21:9': '2176x928', '32:9': '2688x756'}
+           ('21:9', '21:9 (2176 × 928)'), ('32:9', '32:9 (2688 × 760)')]
+ASPECT_SIZES = {'16:10': '1728x1080', '21:9': '2176x928', '32:9': '2688x760'}
 SPEAKERS = [('auto', 'Automatic (the Windows speaker setup)'), ('2', 'Stereo'), ('6', '5.1 surround'), ('8', '7.1 surround')]
 SCALERS = [('fsr1', 'FSR 1 (AMD FidelityFX, sharp)'), ('bilinear', 'Smooth (bilinear)')]
 # The size the 3D scene is drawn at (BB_RENDER_SCALE); FSR 1 rebuilds it at 1920x1080 before the
@@ -1840,6 +1852,9 @@ class Launcher:
     def install_update(self, version, url, page):
         if self.process:
             self.messagebox.showinfo(NAME, _('Close the game before updating.'))
+            return
+        if self.pkg_job:  # closing the launcher for the update would stop it
+            self.messagebox.showinfo(NAME, _('Wait until the PKG install finishes.'))
             return
         if not FROZEN or not url:  # a source tree updates with git
             webbrowser.open(page)

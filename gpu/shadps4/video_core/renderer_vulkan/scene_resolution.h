@@ -19,7 +19,8 @@ inline const NativeDims& Native() {
         const char* env = std::getenv("BB_MLB_RES");
         if (env && std::sscanf(env, "%ux%u", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 7680 &&
             h <= 4320) {
-            return NativeDims{w & ~1u, h & ~1u};
+            return NativeDims{(w + 4) & ~7u, (h + 4) & ~7u}; // as runtime_display.c rounds it
+
         }
         return NativeDims{1920, 1080};
     }();

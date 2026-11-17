@@ -1,0 +1,31 @@
+// Version resource shared by the executables (Explorer > Properties > Details). The numbers come from
+// the VERSION file at the root (gpu/CMakeLists.txt passes them); each .rc defines BB_FILE_DESCRIPTION
+// and BB_ORIGINAL_NAME before including this.
+#include <winver.h>
+#define BB_STR2(x) #x
+#define BB_STR(x) BB_STR2(x)
+#define BB_VERSION_TEXT BB_STR(BB_VERSION_MAJOR) "." BB_STR(BB_VERSION_MINOR) "." BB_STR(BB_VERSION_PATCH)
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION BB_VERSION_MAJOR, BB_VERSION_MINOR, BB_VERSION_PATCH, 0
+PRODUCTVERSION BB_VERSION_MAJOR, BB_VERSION_MINOR, BB_VERSION_PATCH, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "victorgbd"
+            VALUE "FileDescription", BB_FILE_DESCRIPTION
+            VALUE "FileVersion", BB_VERSION_TEXT
+            VALUE "InternalName", BB_ORIGINAL_NAME
+            VALUE "OriginalFilename", BB_ORIGINAL_NAME
+            VALUE "ProductName", "MLB The Show 24 PC port (unofficial)"
+            VALUE "ProductVersion", BB_VERSION_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -35,8 +35,33 @@ for module in argparse base64 collections hashlib json re shutil struct tempfile
               steam_shortcuts pkg_install PIL.ImageTk; do
     hidden+=(--hidden-import "$module")
 done
+# The release version (VERSION): read by the launcher for the update check and written into the
+# executables' version resource (Properties > Details; build.sh does the same for the native ones).
+version=$(tr -d ' \r\n' < VERSION)
+[[ $version =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo "VERSION must be MAJOR.MINOR.PATCH, not '$version'" >&2; exit 1; }
+numbers="${BASH_REMATCH[1]}, ${BASH_REMATCH[2]}, ${BASH_REMATCH[3]}, 0"
+for exe in bb-probe bb-gpu-capabilities bb-play; do
+    found=$(powershell -NoProfile -Command "(Get-Item '$(cygpath -w "$PWD/out/$exe.exe")').VersionInfo.ProductVersion" | tr -d '\r')
+    [[ $found == "$version" ]] || { echo "out/$exe.exe is version '$found', VERSION is $version: run bash build.sh" >&2; exit 1; }
+done
+cat > out/pyi-version.txt <<VERSIONINFO
+VSVersionInfo(
+  ffi=FixedFileInfo(filevers=($numbers), prodvers=($numbers), mask=0x3f, flags=0x0, OS=0x40004,
+                    fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[StringFileInfo([StringTable('040904B0', [
+          StringStruct('CompanyName', 'victorgbd'),
+          StringStruct('FileDescription', '$name launcher'),
+          StringStruct('FileVersion', '$version'),
+          StringStruct('InternalName', '$name'),
+          StringStruct('OriginalFilename', '$name.exe'),
+          StringStruct('ProductName', 'MLB The Show 24 PC port (unofficial)'),
+          StringStruct('ProductVersion', '$version')])]),
+        VarFileInfo([VarStruct('Translation', [0x409, 1200])])])
+VERSIONINFO
 out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN --windowed \
     --name "$name" --icon "$(cygpath -w "$PWD/launcher/mlb.ico")" --distpath out/pyi-dist \
+    --version-file "$(cygpath -w "$PWD/out/pyi-version.txt")" \
+    --add-data "$(cygpath -w "$PWD/VERSION");." \
     --workpath out/pyi-work --specpath out/pyi-work --paths "$(cygpath -w "$PWD/scripts")" \
     --paths "$(cygpath -w "$PWD/launcher")" \
     --add-data "$(cygpath -w "$PWD/launcher/mlb.png");." \

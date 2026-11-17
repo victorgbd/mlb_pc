@@ -255,6 +255,16 @@ endif()
 # linked here, where CMake knows its dependencies (build.sh builds them with ninja).
 if (WIN32)
     enable_language(RC)
+    # The release version (VERSION at the root) in the executables' version resource.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ../VERSION)
+    file(STRINGS ../VERSION BB_VERSION LIMIT_COUNT 1)
+    string(STRIP "${BB_VERSION}" BB_VERSION)  # a CRLF checkout leaves a \r
+    if (NOT BB_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+        message(FATAL_ERROR "VERSION must be MAJOR.MINOR.PATCH, not '${BB_VERSION}'")
+    endif()
+    set_property(SOURCE ../packaging/windows/bb-probe.rc ../packaging/windows/bb-gpu-capabilities.rc
+        ../packaging/windows/play.rc APPEND PROPERTY COMPILE_DEFINITIONS
+        BB_VERSION_MAJOR=${CMAKE_MATCH_1} BB_VERSION_MINOR=${CMAKE_MATCH_2} BB_VERSION_PATCH=${CMAKE_MATCH_3})
     file(GLOB BB_RUNTIME CONFIGURE_DEPENDS ../src/runtime*.c)
     file(GLOB BB_ATRAC9 CONFIGURE_DEPENDS ../third_party/LibAtrac9/C/src/*.c)
     add_library(atrac9 STATIC ${BB_ATRAC9})
