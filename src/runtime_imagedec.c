@@ -33,6 +33,9 @@
 #pragma clang diagnostic pop
 #elif defined(__GNUC__)
 #pragma GCC diagnostic pop
+/* GCC reports stb's static prototypes it left undefined (STBI_ONLY_*: stbi_load_gif_from_memory)
+ * at the end of the file, after the pop. */
+#pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 
 #define HANDLE_MAGIC UINT32_C(0x44454349) /* "ICED" */

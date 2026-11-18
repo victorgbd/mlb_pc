@@ -30,6 +30,7 @@
 #include <execinfo.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <spawn.h>
 #endif
 
 typedef struct { uint64_t address, size, flags; } Segment;
@@ -1413,6 +1414,24 @@ void runtime_restart(void) {
     /* The new launch waits for this process's GPU device to go away (run.py --after). */
     TerminateProcess(GetCurrentProcess(),0);
 #else
+    /* As on Windows: a new run.py (it waits for this one, --after) on the same output, then exit.
+     * posix_spawn (vfork-like) does not copy the guest's address space; the child closes the
+     * descriptors past stderr so this GPU device is gone when this process exits. */
+    const char *command=getenv("BB_RESTART_COMMAND");
+    if (command && *command) {
+        puts("Runtime: restarting through run.py");
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+        char *const spawn_argv[]={(char *)"sh",(char *)"-c",(char *)command,NULL};
+        extern char **environ;
+        pid_t child;
+        const int failed=posix_spawn(&child,"/bin/sh",&actions,NULL,spawn_argv,environ);
+        posix_spawn_file_actions_destroy(&actions);
+        if (!failed) _exit(0);
+        fprintf(stderr,"runtime_restart: posix_spawn failed (%d)\n",failed);
+        _exit(1);
+    }
     puts("Runtime: restarting through run.sh");
     syscall(SYS_close_range, 3u, ~0u, 0u);
     execlp("bash", "bash", "run.sh", (char *)NULL);

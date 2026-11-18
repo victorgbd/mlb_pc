@@ -193,6 +193,12 @@ TRANSLATIONS = {
         'Stopping…': 'Deteniendo…',
         'Wait until the PKG install finishes.': 'Espera a que termine la instalación del PKG.',
         'A PKG install is running. Stop it and close?': 'Hay una instalación de PKG en curso. ¿Detenerla y cerrar?',
+        # Problem report (Log page, Settings)
+        'Report a problem': 'Reportar un problema',
+        'Open the reports folder': 'Abrir la carpeta de reportes',
+        'Could not make the report: {}': 'No se pudo crear el reporte: {}',
+        'Makes a zip with the logs of the last runs and your settings, and opens a new issue on GitHub to attach it. Your user folder is hidden in the files.': 'Crea un zip con los logs de las últimas partidas y tu configuración, y abre un issue nuevo en GitHub para adjuntarlo. Tu carpeta de usuario se oculta en los archivos.',
+        'The report was saved as {}.\n\nThe folder with it opens now, and GitHub opens in the browser with a new issue. Describe the problem there and drag the zip into the issue box (you need a GitHub account).': 'El reporte se guardó como {}.\n\nAhora se abre la carpeta donde está y GitHub en el navegador con un issue nuevo. Describe ahí el problema y arrastra el zip al cuadro del issue (necesitas una cuenta de GitHub).',
     },
 }
 

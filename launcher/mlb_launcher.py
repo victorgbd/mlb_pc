@@ -198,6 +198,8 @@ def select_run_problem(current, output):
 
 def attach_stdio():
     """A windowed executable starts without sys.stdout; inherited pipes or a console still exist."""
+    if sys.platform != 'win32':
+        return
     import msvcrt
     for name, std in (('stdout', -11), ('stderr', -12)):
         if getattr(sys, name) is not None:
@@ -306,8 +308,8 @@ def vibration_strength(s):
 def controller_probe_path():
     """The packaged or development loader, which also provides the lightweight controller probe."""
     configured = os.environ.get('BB_PROBE')
-    candidates = ([Path(configured)] if configured else []) + [PORT_DIR / 'bin' / 'bb-probe.exe',
-                                                               PORT_DIR / 'out' / 'bb-probe.exe']
+    name = 'bb-probe.exe' if sys.platform == 'win32' else 'bb-probe'
+    candidates = ([Path(configured)] if configured else []) + [PORT_DIR / 'bin' / name, PORT_DIR / 'out' / name]
     return next((path for path in candidates if path.is_file()), None)
 
 
@@ -1557,6 +1559,14 @@ class Launcher:
                       lambda: threading.Thread(target=self.check_update, args=(True,), daemon=True).start()
                       ).pack(side='left')
             self.pill(holder, _('Releases page'), lambda: webbrowser.open(RELEASES_PAGE)).pack(side='left', padx=(8, 0))
+        if ISSUES_NEW:
+            self.section(f, _('Report a problem'))
+            self.note(f, _('Makes a zip with the logs of the last runs and your settings, and opens a new issue '
+                           'on GitHub to attach it. Your user folder is hidden in the files.'), top=2)
+            holder = self.buttons_row(f)
+            self.pill(holder, _('Report a problem'), self.report_problem).pack(side='left')
+            self.pill(holder, _('Open the reports folder'),
+                      lambda: self.open_path(str(DATA_DIR / 'reports'))).pack(side='left', padx=(8, 0))
 
     def build_log(self):
         tk = self.tk
@@ -1568,6 +1578,9 @@ class Launcher:
         head.pack(fill='x', padx=self.px(26), pady=(self.px(18), self.px(14)))
         tk.Label(head, text=_('Log'), bg=SURFACE, fg=TEXT, font=self.font_title).pack(side='left')
         self.pill(head, _('Copy'), self.copy_log, background=SURFACE, padding=(16, 6)).pack(side='right')
+        if ISSUES_NEW:
+            self.pill(head, _('Report a problem'), self.report_problem, background=SURFACE,
+                      padding=(16, 6)).pack(side='right', padx=(0, self.px(8)))
         body = tk.Frame(shell, bg=SURFACE)
         body.pack(fill='both', expand=True, padx=self.px(26), pady=(0, self.px(8)))
         self.log = tk.Text(body, bg=CARD, fg='#d6deee', insertbackground=TEXT, font=('Cascadia Mono', 9), wrap='none',
@@ -1707,12 +1720,14 @@ class Launcher:
         try:
             self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+                                            stderr=subprocess.STDOUT, creationflags=NO_WINDOW,
+                                            start_new_session=sys.platform != 'win32')
         except OSError as error:
             self.append(_('Could not start: {}').format(error) + '\n')
             self.process = None
             return
-        self.job = GameJob(self.process)
+        # Linux: the game runs in its own process group instead (terminate_process_tree).
+        self.job = GameJob(self.process) if sys.platform == 'win32' else None
         self.entered, self.last_problem, self.stopping = False, '', False
         threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
         self.play_button.configure(state='disabled')
@@ -1808,7 +1823,25 @@ class Launcher:
         path = Path(path or DATA_DIR)
         if not path.exists():
             path.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(path))
+        open_folder(path)
+
+    def report_problem(self):
+        """Zips the logs, shows the zip in the file manager and opens a filled-in GitHub issue."""
+        try:
+            report = make_report(self.current(), self.log.get('1.0', 'end'))
+        except OSError as error:
+            self.messagebox.showerror(NAME, _('Could not make the report: {}').format(error))
+            return
+        if not self.messagebox.askokcancel(NAME, _(
+                'The report was saved as {}.\n\nThe folder with it opens now, and GitHub opens in the browser '
+                'with a new issue. Describe the problem there and drag the zip into the issue box '
+                '(you need a GitHub account).').format(report.name)):
+            return
+        try:
+            reveal_file(report)
+        except OSError:
+            pass
+        webbrowser.open(issue_url(report.name, self.current()))
 
     # ---- updates -------------------------------------------------------------------------------
     def check_update(self, manual=False):
@@ -2437,7 +2470,11 @@ def terminate_process_tree(process):
     """Stop a launcher process and every child when its Windows job is unavailable."""
     if process.poll() is not None:
         return
-    taskkill = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/taskkill.exe'
+    if sys.platform != 'win32':  # started with start_new_session: its group holds run.py and the game
+        import signal
+        os.killpg(process.pid, signal.SIGTERM)
+        return
+    taskkill =Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/taskkill.exe'
     result = subprocess.run([str(taskkill), '/PID', str(process.pid), '/T', '/F'],
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW, timeout=10)
@@ -2466,8 +2503,9 @@ def latest_release():
     with urllib.request.urlopen(request, timeout=15) as response:
         release = json.load(response)
     version = '.'.join(re.findall(r'\d+', release['tag_name']))
+    # The .zip is the Windows package; elsewhere the release page opens instead (mlb-linux.tar.gz by hand).
     url = next((asset['browser_download_url'] for asset in release.get('assets', [])
-                if asset.get('name', '').lower().endswith('.zip')), None)
+                if asset.get('name', '').lower().endswith('.zip')), None) if sys.platform == 'win32' else None
     return version, url, release.get('html_url') or RELEASES_PAGE
 
 
@@ -2496,6 +2534,113 @@ def install_update(target, wait_pid):
         return 1
     subprocess.Popen([str(target / EXE_NAME)], cwd=str(target))
     return 0
+
+
+ISSUES_NEW = f'https://github.com/{RELEASES_REPO}/issues/new' if RELEASES_REPO else ''
+REPORT_LOG_BYTES = 6 * 1024 * 1024  # per log: the end is kept (GitHub takes attachments up to 25 MB)
+
+
+def hide_home(text):
+    """The text with the user's home folder written as ~ (the report should not carry the account name)."""
+    home = str(Path.home())
+    for variant in {home, home.replace('\\', '/'), home.replace('/', '\\')}:
+        if len(variant) > 3:
+            text = re.sub(re.escape(variant), '~', text, flags=re.IGNORECASE)
+    return text
+
+
+def system_summary(settings):
+    """Launcher version, operating system and settings, for a problem report."""
+    import platform
+    lines = [f'{NAME} launcher {VERSION}{" (frozen)" if FROZEN else ""}',
+             f'OS: {platform.platform()} ({platform.machine()})',
+             f'Python: {platform.python_version()}',
+             f'CPU threads: {os.cpu_count()}']
+    try:
+        if sys.platform.startswith('linux'):
+            for line in Path('/etc/os-release').read_text(encoding='utf-8').splitlines():
+                if line.startswith('PRETTY_NAME='):
+                    lines.append('Distribution: ' + line.split('=', 1)[1].strip('"'))
+    except OSError:
+        pass
+    # Art, key bindings and the player name say nothing about a problem.
+    skip = {'player_name', 'art_banner', 'art_cover', 'steam_art', 'art_crops', 'shortcut_icon'}
+    shown = {key: value for key, value in settings.items() if key not in skip}
+    lines += ['', 'Settings:', json.dumps(shown, indent=2, ensure_ascii=False, sort_keys=True, default=str)]
+    return hide_home('\n'.join(lines) + '\n')
+
+
+def make_report(settings, launcher_log='', folder=None):
+    """A zip with what helps to understand a problem: the last runs' logs (saves folder), bbport.ini,
+    input.ini, the Log page and a system summary. Paths under the home folder are written as ~."""
+    user_dir = Path(settings.get('user_dir') or DATA_DIR / 'user')
+    folder = Path(folder or DATA_DIR / 'reports')
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / time.strftime('mlb-report-%Y%m%d-%H%M%S.zip')
+
+    def read_tail(path):
+        with open(path, 'rb') as source:
+            size = source.seek(0, os.SEEK_END)
+            source.seek(max(0, size - REPORT_LOG_BYTES))
+            data = source.read().decode('utf-8', errors='replace')
+        return ('[... start cut ...]\n' if size > REPORT_LOG_BYTES else '') + data
+
+    with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('system.txt', system_summary(settings))
+        if launcher_log.strip():
+            archive.writestr('launcher_log.txt', hide_home(launcher_log))
+        candidates = [user_dir / 'last_run.log', *(user_dir / f'last_run.{n}.log' for n in range(1, 5)),
+                      DATA_DIR / 'last_run.log', DATA_DIR / 'bbport.ini', DATA_DIR / 'input.ini']
+        seen = set()
+        for path in candidates:
+            try:
+                key = path.resolve()
+                if key in seen or not path.is_file():
+                    continue
+                seen.add(key)
+                name = path.name if path.parent == user_dir or path.suffix == '.ini' else 'install_' + path.name
+                archive.writestr(name, hide_home(read_tail(path)))
+            except OSError:
+                pass
+    return target
+
+
+def issue_url(report_name, settings):
+    """The new-issue page of the repository, filled in (GitHub links cannot attach files: the body asks
+    for the zip to be dragged in)."""
+    import platform
+    from urllib.parse import urlencode
+    body = '\n'.join([
+        '### What happened', '<!-- Describe the problem: what you did, what you expected, what you saw. -->', '', '',
+        '### Logs', f'<!-- Drag {report_name} (the folder that opened) into this box. -->', '', '',
+        '### System',
+        f'- Launcher: {VERSION}',
+        f'- OS: {platform.platform()}',
+        f'- Window size / aspect: {settings.get("window_size", "?")} / {settings.get("aspect", "?")}',
+        '- GPU: <!-- e.g. RTX 4070, driver 566.36 -->',
+    ])
+    return ISSUES_NEW + '?' + urlencode({'title': '[Bug] ', 'body': hide_home(body)})
+
+
+def reveal_file(path):
+    """Opens the file manager on the folder of path, with the file selected where the system allows it."""
+    path = Path(path)
+    if sys.platform == 'win32':
+        subprocess.Popen(['explorer', f'/select,{path}'])
+    elif sys.platform == 'darwin':
+        subprocess.Popen(['open', '-R', str(path)])
+    else:
+        open_folder(path.parent)
+
+
+def open_folder(path):
+    """Opens a folder in the system's file manager (Windows Explorer, xdg-open on Linux)."""
+    if sys.platform == 'win32':
+        os.startfile(str(path))
+    elif sys.platform == 'darwin':
+        subprocess.Popen(['open', str(path)])
+    else:
+        subprocess.Popen(['xdg-open', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def open_run_log(log_dir, keep=5):

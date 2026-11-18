@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <x86intrin.h>
 #include <chrono>
 #include <array>
 #include <map>
@@ -276,7 +277,7 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
         SideQueueReadBack(arena, copies, total, write_tick);
     }
     for (const VAddr at : pages) {
-        gpu_modified_ranges.Subtract(at, TRACKER_BYTES_PER_PAGE);
+        ++gpu_range_generation, gpu_modified_ranges.Subtract(at, TRACKER_BYTES_PER_PAGE);
         memory_tracker->UnmarkRegionAsGpuModified(at, TRACKER_BYTES_PER_PAGE);
     }
     BbStats::gpu_side_download_ns.fetch_add(
@@ -388,7 +389,7 @@ bool BufferCache::DownloadCompletedRanges(VAddr page, u64 length) {
     }
     SideQueueReadBack(arena, copies, total, write_tick);
     for (const auto& [start, end] : done) {
-        gpu_modified_ranges.Subtract(start, end - start);
+        ++gpu_range_generation, gpu_modified_ranges.Subtract(start, end - start);
         gpu_write_ticks.erase(WriteTicks::interval_type{start, end});
     }
     for (VAddr at = page; at < page + length; at += TRACKER_BYTES_PER_PAGE) {
@@ -832,6 +833,7 @@ u32 LastGpuUse(VAddr address, u64 size) {
 } // namespace
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    BumpObtainEpoch(); // a guest write: ObtainBuffer results may change
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         // bbport: a guest write to a page holding GPU data read that data back first, which
         // waits for the whole GPU queue (U3's Cartagena square: ~70 times a second, 5-20 ms each,
@@ -878,7 +880,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
             }
             if (dead_frames && frames >= dead_frames && gpu_write <= frames - dead_frames &&
                 gpu_use <= frames - dead_frames) {
-                gpu_modified_ranges.Subtract(page, length);
+                ++gpu_range_generation, gpu_modified_ranges.Subtract(page, length);
                 memory_tracker->UnmarkRegionAsGpuModified(page, length);
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
                 BbStats::dead_gpu_drops.fetch_add(1, std::memory_order_relaxed);
@@ -1049,6 +1051,7 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    BumpObtainEpoch();
     const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
@@ -1093,7 +1096,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             total_size_bytes += (new_size + align - 1) & mask;
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        gpu_modified_ranges.Subtract(address, size);
+        ++gpu_range_generation, gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
         return;
@@ -1334,12 +1337,42 @@ void BufferCache::CheckStableBindings() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    if (BbToggle::Disabled(BbToggle::ObtainMemo) || BufferStatsEnabled()) {
+        return ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer);
+    }
+    const u64 tick = scheduler.CurrentTick();
+    const u64 epoch = obtain_epoch.load(std::memory_order_acquire);
+    auto& memo = obtain_memos[((device_addr >> 4) ^ (device_addr >> 13) ^ size) % obtain_memos.size()];
+    if (memo.address == device_addr && memo.size == size && memo.is_written == is_written &&
+        memo.is_texel == is_texel_buffer && memo.tick == tick && memo.epoch == epoch &&
+        memo.generation == gpu_range_generation) {
+        return {memo.buffer, memo.offset};
+    }
+    const auto result = ObtainBufferUncached(device_addr, size, is_written, is_texel_buffer);
+    // The epoch read before the call: a fault meanwhile keeps the entry invalid.
+    memo = {device_addr, size, is_written, is_texel_buffer, result.first, result.second,
+            scheduler.CurrentTick() == tick ? tick : ~0ULL, epoch, gpu_range_generation};
+    return result;
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferUncached(VAddr device_addr, u32 size,
+                                                        bool is_written, bool is_texel_buffer) {
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
         NoteHotUse(device_addr, size);
     }
+    u64 ot = BbStats::obtain_timing ? __rdtsc() : 0;
+    const auto olap = [&ot](u32 part) {
+        if (ot) {
+            const u64 now = __rdtsc();
+            BbStats::obtain_cycles[part].fetch_add(now - ot, std::memory_order_relaxed);
+            BbStats::obtain_calls[part].fetch_add(1, std::memory_order_relaxed);
+            ot = now;
+        }
+    };
     NoteGpuUse(device_addr, size);
+    olap(0);
     if (StableCheckEnabled() && !is_written && size >= 16 &&
         memory->IsValidGpuMapping(device_addr, size) && !IsRegionGpuModified(device_addr, size)) {
         std::scoped_lock lk{stable_mutex};
@@ -1368,6 +1401,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                     .size = size,
                     .extra = reinterpret_cast<u64>(static_cast<Buffer*>(&stream_buffer)),
                 });
+                olap(1);
                 return {&stream_buffer, *offset};
             }
         }
@@ -1385,9 +1419,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                     static_cast<unsigned long long>(arena->cpu_addr),
                     static_cast<unsigned long long>(arena->cpu_addr + arena->size_bytes));
     }
+    if (ot) ot = __rdtsc();
     EnsureResident(arena, first_block, last_block);
+    olap(2);
     const u64 uploaded_before = BbStats::buffer_upload_bytes.load(std::memory_order_relaxed);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    olap(3);
     if (stats) {
         auto& region = Stats().regions[RegionKey(device_addr)];
         ++region.arena_count;
@@ -1414,9 +1451,18 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                             is_texel_buffer ? " texel" : "");
             }
         }
-        gpu_modified_ranges.Add(device_addr, size);
-        gpu_write_ticks += std::make_pair(WriteTicks::interval_type{device_addr, device_addr + size},
-                                          scheduler.CurrentTick());
+        if (ot) ot = __rdtsc();
+        const u64 tick = scheduler.CurrentTick();
+        auto& recent = written_ranges[(device_addr >> 12) % written_ranges.size()];
+        if (recent.address != device_addr || recent.size != size || recent.tick != tick ||
+            recent.generation != gpu_range_generation ||
+            BbToggle::Disabled(BbToggle::WrittenRangeMemo)) {
+            gpu_modified_ranges.Add(device_addr, size);
+            gpu_write_ticks += std::make_pair(
+                WriteTicks::interval_type{device_addr, device_addr + size}, tick);
+            recent = {device_addr, size, tick, gpu_range_generation};
+        }
+        olap(4);
     }
     return {arena, arena->Offset(device_addr)};
 }
@@ -1740,7 +1786,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 for (const auto& shadow : it->second) {
                     ForEachShadowRun(shadow, [&](size_t i, size_t j, bool guest_owned) {
                         if (guest_owned) {
-                            gpu_modified_ranges.Subtract(shadow.start + i, j - i);
+                            ++gpu_range_generation, gpu_modified_ranges.Subtract(shadow.start + i, j - i);
                             return;
                         }
                         const VAddr skip = shadow.start + i;

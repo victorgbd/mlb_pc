@@ -28,6 +28,15 @@ def fail(message):
 
 
 def wait_for(pid):
+    if os.name != 'nt':
+        import time
+        for _i in range(300):  # up to 30 s, as on Windows
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return
+            time.sleep(0.1)
+        return
     kernel32 = ctypes.windll.kernel32
     SYNCHRONIZE = 0x00100000
     handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
@@ -38,6 +47,8 @@ def wait_for(pid):
 
 def no_console():
     """Started without a console (the launcher): console programs must not open their own."""
+    if os.name != 'nt':
+        return 0
     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
 
 
@@ -166,9 +177,13 @@ def main():
     if not env.get('BB_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['BB_FSR411_DIR'] = str(data / 'fsr4_411')
 
-    probe = Path(env['BB_PROBE']) if env.get('BB_PROBE') else find_executable('bb-probe.exe')
+    probe_name = 'bb-probe.exe' if os.name == 'nt' else 'bb-probe'
+    probe = Path(env['BB_PROBE']) if env.get('BB_PROBE') else find_executable(probe_name)
     if not probe or not probe.is_file():
-        fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
+        fail(f'{probe_name} not found: build it with build.sh or use a packaged build.')
+    # Linux package: libbbgpu.so and the libraries it brings (protobuf) are in bin/gpu.
+    if os.name != 'nt' and (probe.parent / 'gpu').is_dir():
+        env['LD_LIBRARY_PATH'] = os.pathsep.join(filter(None, [str(probe.parent / 'gpu'), env.get('LD_LIBRARY_PATH')]))
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
     if not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
@@ -213,7 +228,12 @@ def main():
                        *(['--own'] if env.get(f'BB_GAME_DIR_{key.upper()}') else []))
         this = ['--run'] if getattr(sys, 'frozen', False) else [str(Path(__file__).resolve())]
         env['BB_EXE'] = exe
-        env['BB_RESTART_COMMAND'] = subprocess.list2cmdline([sys.executable, *this, '--after', str(os.getpid()), *args])
+        restart = [sys.executable, *this, '--after', str(os.getpid()), *args]
+        if os.name == 'nt':
+            env['BB_RESTART_COMMAND'] = subprocess.list2cmdline(restart)
+        else:  # run by /bin/sh -c (probe.c runtime_restart)
+            import shlex
+            env['BB_RESTART_COMMAND'] = shlex.join(restart)
         command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                    '--app0', str(game), '--user', str(user_dir), '--timeout', env.get('BB_TIMEOUT', '0')]
         if guest_argv:

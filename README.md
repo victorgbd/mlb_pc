@@ -51,6 +51,23 @@ python launcher/mlb_launcher.py         # the launcher, from a python.org Python
 bash packaging/windows/package_mlb.sh   # dist/mlb-windows/ and dist/mlb-windows.zip
 ```
 
+### Linux (experimental)
+
+The same `build.sh` builds the Linux binaries with GCC (`out/bb-probe`, `out/gpu/libbbgpu.so`,
+`out/bb-gpu-capabilities`). It compiles on Ubuntu 26.04; running the game on Linux is not tested yet.
+
+```bash
+sudo apt install build-essential cmake ninja-build pkg-config git rsync \
+  libvulkan-dev glslang-dev glslang-tools libvulkan-memory-allocator-dev \
+  spirv-headers spirv-cross libspirv-cross-c-shared-dev \
+  libsdl3-dev libfmt-dev libboost-dev robin-map-dev libxxhash-dev libzydis-dev libxbyak-dev \
+  libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
+  libprotobuf-dev protobuf-compiler nlohmann-json3-dev libssl-dev zlib1g-dev libminiupnpc-dev \
+  libx11-dev libxcb1-dev libwayland-dev python3-tk python3-pil python3-pil.imagetk
+git submodule update --init --recursive
+BB_PGO=off bash build.sh
+```
+
 `run.py` prepares the game (linked image, content profile, trophies) and starts `bb-probe.exe`;
 `BB_*` variables tune it (docs/MLB_PORT.md). The package freezes the launcher with PyInstaller
 (a private venv in `out/pyenv`) into `MLB The Show 24.exe`, which also runs `run.py` (`--run`),

@@ -8,6 +8,7 @@ fsr4_shaders/
 pgo/
 *.png
 last_run.log
+/reports/
 dist/
 packaging/runtime-paths.nix
 fsr4_411/

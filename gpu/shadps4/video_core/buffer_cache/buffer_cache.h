@@ -106,6 +106,10 @@ public:
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
+    /// ObtainBuffer without the memo of recent results (ObtainMemo).
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferUncached(VAddr device_addr, u32 size,
+                                                                     bool is_written,
+                                                                     bool is_texel_buffer);
 
     /// bbport: the 64-dword copy of the game's mesh raycasters moves GPU results into a record
     /// array the guest CPU reads. Instead of waiting for the GPU at the dispatch, the guest part
@@ -241,6 +245,33 @@ private:
                                  boost::icl::inplace_max, boost::icl::inter_section,
                                  ICL_INTERVAL_INSTANCE(ICL_INTERVAL_DEFAULT, VAddr, std::less)>;
     WriteTicks gpu_write_ticks;
+    /// bbport: bumped whenever a range leaves gpu_modified_ranges/gpu_write_ticks. A buffer the
+    /// GPU writes again with the same range and tick needs no new insertion while it holds
+    /// (MLB's cloth: ~420 dispatches a frame write the same range, ~0.9 us per pair of inserts).
+    u64 gpu_range_generation = 0;
+    struct WrittenRange {
+        VAddr address = 0;
+        u64 size = 0, tick = 0, generation = ~0ULL;
+    };
+    std::array<WrittenRange, 16> written_ranges{};
+public:
+    /// bbport: the results of ObtainBuffer reused for the same range while nothing could change
+    /// them (ObtainMemo, toggle 1<<61): MLB's cloth runs ~420 dispatches a frame binding the same
+    /// buffers. Bumped by every guest write fault and read-back, and by the rasterizer for every
+    /// packet that is not a draw or dispatch (fences, data writes, DMA).
+    void BumpObtainEpoch() noexcept {
+        obtain_epoch.fetch_add(1, std::memory_order_release);
+    }
+private:
+    struct ObtainMemo {
+        VAddr address = 0;
+        u32 size = 0;
+        bool is_written = false, is_texel = false;
+        const Buffer* buffer = nullptr;
+        u64 offset = 0, tick = ~0ULL, epoch = ~0ULL, generation = ~0ULL;
+    };
+    std::array<ObtainMemo, 64> obtain_memos{};
+    std::atomic<u64> obtain_epoch{0};
     /// The GPU-written ranges of a page whose writing work has completed, read back before the
     /// guest writes over them (InvalidateMemory). False when none could be.
     bool DownloadCompletedRanges(VAddr page, u64 length);
