@@ -301,6 +301,20 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
+    // bbport: a range beyond the image is clamped to it, as its views are (FindView). An array
+    // T# can claim slices the image was not created with (base_array 4096 on a 43-layer image:
+    // ImageInfo sizes arrays from the slices their views reach); its state indices then ran past
+    // the state table (assertion, the game stopped).
+    if (subres_range) {
+        auto& range = *subres_range;
+        const u32 levels = std::max<u32>(info.resources.levels, 1);
+        const u32 layers = std::max<u32>(info.resources.layers, 1);
+        range.base.level = std::min<u32>(range.base.level, levels - 1);
+        range.base.layer = std::min<u32>(range.base.layer, layers - 1);
+        range.extent.levels = std::clamp<u32>(range.extent.levels, 1, levels - range.base.level);
+        range.extent.layers = std::clamp<u32>(range.extent.layers, 1, layers - range.base.layer);
+    }
+
     const bool needs_partial_transition =
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);

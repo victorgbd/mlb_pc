@@ -900,7 +900,79 @@ bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 to
     return true;
 }
 
+// bbport diagnosis (BB_DRAW_PHASES=1): cycles the draw recording thread spends per packet kind
+// and per phase of a direct draw, printed every 5 s.
+namespace DrawPhases {
+enum Kind : u32 { KDraw, KDispatch, KIndirect, KSpecial, KTask, NumKinds };
+enum Phase : u32 { PPending, PState, PBind, PBegin, PInputs, PRest, IBind, IVertex, IArgs, IRest, DBuf, DTex, IBuf, ITex, NumPhases };
+static bool On() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_DRAW_PHASES");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+static std::atomic<u64> kind_cycles[NumKinds], kind_count[NumKinds], phase_cycles[NumPhases];
+static std::atomic<u64> indirect_count_sum{0}, indirect_bytes_sum{0};
+static thread_local bool in_indirect = false;
+static void Report() {
+    static auto window = std::chrono::steady_clock::now();
+    static u64 window_tsc = __rdtsc();
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - window).count();
+    if (seconds < 5.0) {
+        return;
+    }
+    const u64 tsc = __rdtsc();
+    const double cycles_per_us = double(tsc - window_tsc) / (seconds * 1e6);
+    window = now;
+    window_tsc = tsc;
+    static constexpr const char* kinds[] = {"draw", "dispatch", "indirect", "special", "task"};
+    static constexpr const char* phases[] = {"pending ops", "render state", "bind resources",
+                                             "begin rendering", "vertex/index/barriers", "rest",
+                                             "INDIRECT bind resources", "INDIRECT vertex/index",
+                                             "INDIRECT args buffers", "INDIRECT rest",
+                                             "  direct: BindBuffers", "  direct: BindTextures",
+                                             "  INDIRECT: BindBuffers", "  INDIRECT: BindTextures"};
+    std::printf("Draw phases over %.1f s (stage B, us per packet, ms per second):\n", seconds);
+    for (u32 k = 0; k < NumKinds; ++k) {
+        const u64 n = kind_count[k].exchange(0), c = kind_cycles[k].exchange(0);
+        if (n) {
+            std::printf("  %-10s %7.0f/s %7.2f us %7.1f ms/s\n", kinds[k], n / seconds,
+                        c / cycles_per_us / n, c / cycles_per_us / 1e3 / seconds);
+        }
+    }
+    {
+        const u64 n = kind_count[KIndirect].load();
+        (void)n;
+        std::printf("    indirect args: %.0f draws, %.0f KiB in all per second%s",
+                    indirect_count_sum.exchange(0) / seconds,
+                    indirect_bytes_sum.exchange(0) / 1024.0 / seconds, "\n");
+    }
+    for (u32 p = 0; p < NumPhases; ++p) {
+        const u64 c = phase_cycles[p].exchange(0);
+        std::printf("    draw %-22s %7.1f ms/s\n", phases[p], c / cycles_per_us / 1e3 / seconds);
+    }
+}
+static void Add(Phase p, u64 cycles) {
+    phase_cycles[p].fetch_add(cycles, std::memory_order_relaxed);
+}
+} // namespace DrawPhases
+
 void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
+    const u64 phase_start = DrawPhases::On() ? __rdtsc() : 0;
+    u32 phase_kind = DrawPhases::KTask;
+    struct PhaseEnd {
+        const u64& start;
+        u32& kind;
+        ~PhaseEnd() {
+            if (start) {
+                DrawPhases::kind_cycles[kind].fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+                DrawPhases::kind_count[kind].fetch_add(1, std::memory_order_relaxed);
+                DrawPhases::Report();
+            }
+        }
+    } phase_end{phase_start, phase_kind};
     auto& self = *static_cast<Rasterizer*>(context);
     if (*reinterpret_cast<const PacketKind*>(data) == PacketKind::Task) {
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
@@ -1005,6 +1077,10 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     stage_regs = &regs;
     self.pipe_cb_extent = packet.cb_extent;
     self.pipe_db_extent = packet.db_extent;
+    phase_kind = packet.kind == PacketKind::Special ? DrawPhases::KSpecial
+                 : indirect                           ? DrawPhases::KIndirect
+                 : cs                                 ? DrawPhases::KDispatch
+                                                      : DrawPhases::KDraw;
     if (packet.kind == PacketKind::Special) {
         // A draw FilterDraw handles (fast clear elimination, resolve, depth copy, skip).
         FrameCapture::Poll();
@@ -1492,9 +1568,15 @@ static bool SkipShader(u64 hash) {
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
+    const u64 rest_start = DrawPhases::On() ? __rdtsc() : 0;
+    u64 rest_excluded = 0;
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
+        if (rest_start) {
+            rest_excluded = __rdtsc() - rest_start;
+            DrawPhases::Add(DrawPhases::PPending, rest_excluded);
+        }
     }
     if (const auto* skip_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         skip_ps && SkipShader(skip_ps->pgm_hash)) {
@@ -1545,7 +1627,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
 
-    PrepareRenderState(pipeline);
+    {
+        const u64 t = rest_start ? __rdtsc() : 0;
+        PrepareRenderState(pipeline);
+        if (t) {
+            const u64 d = __rdtsc() - t;
+            DrawPhases::Add(DrawPhases::PState, d);
+            rest_excluded += d;
+        }
+    }
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -1557,14 +1647,26 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // commands are recorded after BeginRendering, as before).
     draw_inputs = {pipeline, draw_prepared, index_offset, is_indexed, true, false};
     current_vs_hash = u32(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+    const u64 bind_t = rest_start ? __rdtsc() : 0;
     const bool bound = BindResources(pipeline);
+    if (bind_t) {
+        const u64 d = __rdtsc() - bind_t;
+        DrawPhases::Add(DrawPhases::PBind, d);
+        rest_excluded += d;
+    }
     bind_prepared = nullptr; // indirect draws and dispatches bind without prepared sharps
     const bool inputs_resolved = draw_inputs.resolved;
     draw_inputs.pending = false;
     if (!bound) {
         return;
     }
+    const u64 begin_t = rest_start ? __rdtsc() : 0;
     const auto state = BeginRendering(pipeline);
+    const u64 inputs_t = rest_start ? __rdtsc() : 0;
+    if (begin_t) {
+        DrawPhases::Add(DrawPhases::PBegin, inputs_t - begin_t);
+        rest_excluded += inputs_t - begin_t;
+    }
 
     if (!inputs_resolved) {
         ResolveVertexBuffers(pipeline, draw_prepared);
@@ -1580,6 +1682,20 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    if (inputs_t) {
+        const u64 d = __rdtsc() - inputs_t;
+        DrawPhases::Add(DrawPhases::PInputs, d);
+        rest_excluded += d;
+    }
+    struct RestEnd {
+        const u64& start;
+        u64& excluded;
+        ~RestEnd() {
+            if (start) {
+                DrawPhases::Add(DrawPhases::PRest, __rdtsc() - start - excluded);
+            }
+        }
+    } rest_end{rest_start, rest_excluded};
 
     // bbport: screen-space (clip disabled) draws into the upscaler's output-size images.
     push_data.xscale *= target_scale[0];
@@ -1951,15 +2067,32 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                          cb_descs[0].first, db_desc.first,
                          UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
     }
-    if (!BindResources(pipeline)) {
+    u64 t = DrawPhases::On() ? __rdtsc() : 0;
+    const auto lap = [&t](DrawPhases::Phase p) {
+        if (t) {
+            const u64 now = __rdtsc();
+            DrawPhases::Add(p, now - t);
+            t = now;
+        }
+    };
+    if (t) {
+        DrawPhases::indirect_count_sum.fetch_add(max_count, std::memory_order_relaxed);
+        DrawPhases::indirect_bytes_sum.fetch_add(u64(stride) * max_count, std::memory_order_relaxed);
+    }
+    DrawPhases::in_indirect = true;
+    const bool bound_ok = BindResources(pipeline);
+    DrawPhases::in_indirect = false;
+    if (!bound_ok) {
         return;
     }
+    lap(DrawPhases::IBind);
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer();
     }
+    lap(DrawPhases::IVertex);
 
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
@@ -1972,6 +2105,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
     }
 
+    lap(DrawPhases::IArgs);
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -2034,6 +2168,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 
     ResetBindings(false);
     scheduler.KickRecording();
+    lap(DrawPhases::IRest);
 }
 
 void Rasterizer::NoteSmallWrittenBuffers(const Shader::Info& stage) {
@@ -2727,8 +2862,15 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                               stage->samplers.size());
             stage->PushUd(binding, push_data);
             const PreparedStage* prepared = FindPreparedStage(*stage);
+            const u64 t0 = DrawPhases::On() ? __rdtsc() : 0;
             BindBuffers(*stage, prepared, binding, push_data, set_write_index);
+            const u64 t1 = t0 ? __rdtsc() : 0;
             BindTextures(*stage, prepared, binding, set_write_index, needs_barrier);
+            if (t0) {
+                const u64 t2 = __rdtsc();
+                DrawPhases::Add(DrawPhases::in_indirect ? DrawPhases::IBuf : DrawPhases::DBuf, t1 - t0);
+                DrawPhases::Add(DrawPhases::in_indirect ? DrawPhases::ITex : DrawPhases::DTex, t2 - t1);
+            }
             uses_dma |= stage->uses_dma;
         }
     } else {

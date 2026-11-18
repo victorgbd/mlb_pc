@@ -343,6 +343,11 @@ them.
   and beyond those at most 512 MiB of layers (`BB_ARRAY_CLAMP=0`: off; the clamped images are
   logged). Peak in a match on the GTX 1650: ~3.5 GB. `BB_VRAM_LOG=1` now also logs every image
   of 64 MiB or more.
+  Fixed 2026-11-18 (0.4.3): some array T#s are incoherent (base_array 4096, last_array 42 on a
+  128x128 array declaring 7761 layers): the image got 43 layers and its view was clamped
+  (FindView), but the barrier for the binding still used layer 4096 and indexed past the
+  subresource state table (`image.cpp GetBarriers: Assertion Failed`, the game stopped while a
+  stadium loaded; in 0.4.1 and 0.4.2). Image::GetBarriers clamps the range to the image now.
 - Frame rate investigation (2026-11-17, i5-10300H + GTX 1650, 16:9, pitching view, ~37-41 FPS,
   frame pacing median 33 ms at 60 Hz):
   - The game's main thread waits ~15 ms per frame on a condition variable (BB_WAIT_STATS: "main
@@ -368,6 +373,14 @@ them.
   - Diagnostics: BB_WAIT_STATS=1 (time blocked per guest thread and wait kind, who signals the
     main thread's condition), BB_EOP_STATS=1, BB_MUTEX_STATS=1, BB_FRAME_STATS (fault resolve
     wait and run time).
+  - Stage B per second in a match (BB_DRAW_PHASES=1, 2026-11-18): ~23k direct draws at ~8 us
+    (~180 ms), ~30k compute dispatches at ~4.5 us (~105-150 ms), ~11k in-order tasks (fences,
+    writes) at ~4-7 us (~50-75 ms), ~150 indirect draws at ~220-575 us (~40-85 ms, almost all in
+    BindTextures). BindBuffers ~115-128 ms (draws and dispatches), BindTextures ~60-75 ms for
+    direct draws. The crowd's texture tables (1024 T#s each) are not the indirect draws' cost
+    (the same with BB_IMAGE_TABLES=0); a memo of the table entries measured no gain in an
+    in-match A/B and was dropped. Run-to-run and in-run variance (EOP 13-27 ms as the match
+    moves on) needs in-run A/B toggles to judge changes.
 - Profiling on Windows: guest threads now carry their names as thread descriptions
   (SetThreadDescription), so profilers and debuggers show MainMultiTask, KineCore_MT, ...
   `BB_FRAME_STATS=1` adds "host copy waits" by caller (WaitHostCopies/WaitDeferredSignals;
