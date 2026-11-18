@@ -72,6 +72,10 @@ enum : std::uint64_t {
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
     /// One upscaler frame start per frame (Uncharted draws twice into its display buffer).
     OneFrameStart = 1ull << 59,
+    /// BufferCache: a GPU write of the range and tick last inserted is not inserted again.
+    WrittenRangeMemo = 1ull << 60,
+    /// BufferCache::ObtainBuffer results reused within a tick while no guest write happened.
+    ObtainMemo = 1ull << 61,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
@@ -91,6 +95,10 @@ inline std::atomic<std::uint64_t> gpu_merges{0};
 inline std::atomic<std::uint64_t> gpu_side_downloads{0}, gpu_side_download_ns{0};
 /// Guest writes resolved on the GPU thread: how many, the writer's total wait, the resolve time.
 inline std::atomic<std::uint64_t> fault_resolves{0}, fault_resolve_wait_ns{0}, fault_resolve_run_ns{0};
+/// BB_DRAW_PHASES: cycles in parts of BufferCache::ObtainBuffer (gpu use, stream copy, resident,
+/// synchronize, written ranges) and their calls, while measuring.
+inline std::atomic<std::uint64_t> obtain_cycles[5], obtain_calls[5];
+inline bool obtain_timing = false;
 inline std::atomic<std::int64_t> hot_pages{0};
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};

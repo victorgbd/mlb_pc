@@ -597,6 +597,9 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
+    // Work after a drain runs here, outside the draw packets (copies, fills, writes):
+    // no ObtainBuffer result is reused across it.
+    buffer_cache.BumpObtainEpoch();
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     if (!stats) {
         draw_pipe->Drain(reason);
@@ -904,17 +907,20 @@ bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 to
 // and per phase of a direct draw, printed every 5 s.
 namespace DrawPhases {
 enum Kind : u32 { KDraw, KDispatch, KIndirect, KSpecial, KTask, NumKinds };
-enum Phase : u32 { PPending, PState, PBind, PBegin, PInputs, PRest, IBind, IVertex, IArgs, IRest, DBuf, DTex, IBuf, ITex, NumPhases };
+enum Phase : u32 { PPending, PState, PBind, PBegin, PInputs, PRest, IBind, IVertex, IArgs, IRest, DBuf, DTex, IBuf, ITex, CClamp, CObtain, CInvalidate, CAccess, CBind, NumPhases };
 static bool On() {
     static const bool on = [] {
         const char* env = std::getenv("BB_DRAW_PHASES");
-        return env && env[0] == '1';
+        const bool value = env && env[0] == '1';
+        BbStats::obtain_timing = value;
+        return value;
     }();
     return on;
 }
 static std::atomic<u64> kind_cycles[NumKinds], kind_count[NumKinds], phase_cycles[NumPhases];
 static std::atomic<u64> indirect_count_sum{0}, indirect_bytes_sum{0};
 static thread_local bool in_indirect = false;
+static thread_local bool in_dispatch = false;
 static void Report() {
     static auto window = std::chrono::steady_clock::now();
     static u64 window_tsc = __rdtsc();
@@ -933,7 +939,10 @@ static void Report() {
                                              "INDIRECT bind resources", "INDIRECT vertex/index",
                                              "INDIRECT args buffers", "INDIRECT rest",
                                              "  direct: BindBuffers", "  direct: BindTextures",
-                                             "  INDIRECT: BindBuffers", "  INDIRECT: BindTextures"};
+                                             "  INDIRECT: BindBuffers", "  INDIRECT: BindTextures",
+                                             "DISPATCH buf ClampRangeSize", "DISPATCH buf ObtainBuffer",
+                                             "DISPATCH buf InvalidateFromGPU", "DISPATCH buf IsBufferAccessed",
+                                             "DISPATCH BindResources"};
     std::printf("Draw phases over %.1f s (stage B, us per packet, ms per second):\n", seconds);
     for (u32 k = 0; k < NumKinds; ++k) {
         const u64 n = kind_count[k].exchange(0), c = kind_cycles[k].exchange(0);
@@ -948,6 +957,15 @@ static void Report() {
         std::printf("    indirect args: %.0f draws, %.0f KiB in all per second%s",
                     indirect_count_sum.exchange(0) / seconds,
                     indirect_bytes_sum.exchange(0) / 1024.0 / seconds, "\n");
+    }
+    {
+        static constexpr const char* parts[] = {"gpu use", "stream copy", "resident",
+                                                "synchronize", "written ranges"};
+        for (u32 i = 0; i < 5; ++i) {
+            const u64 c = BbStats::obtain_cycles[i].exchange(0), n = BbStats::obtain_calls[i].exchange(0);
+            std::printf("    ObtainBuffer %-15s %7.1f ms/s %8.0f calls/s%s", parts[i],
+                        c / cycles_per_us / 1e3 / seconds, n / seconds, "\n");
+        }
     }
     for (u32 p = 0; p < NumPhases; ++p) {
         const u64 c = phase_cycles[p].exchange(0);
@@ -975,6 +993,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     } phase_end{phase_start, phase_kind};
     auto& self = *static_cast<Rasterizer*>(context);
     if (*reinterpret_cast<const PacketKind*>(data) == PacketKind::Task) {
+        self.buffer_cache.BumpObtainEpoch(); // fences, data writes, DMA: no reuse across them
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
         task.task(self, data + sizeof(TaskPacket));
         return;
@@ -2399,7 +2418,14 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         }
     }
 
-    if (!BindResources(pipeline)) {
+    const u64 bind_t0 = DrawPhases::On() ? __rdtsc() : 0;
+    DrawPhases::in_dispatch = true;
+    const bool bound_ok = BindResources(pipeline);
+    DrawPhases::in_dispatch = false;
+    if (bind_t0) {
+        DrawPhases::Add(DrawPhases::CBind, __rdtsc() - bind_t0);
+    }
+    if (!bound_ok) {
         return;
     }
     NoteSmallWrittenBuffers(cs);
@@ -3497,7 +3523,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
+                const bool time_ops = DrawPhases::in_dispatch && DrawPhases::On();
+                u64 op_t = time_ops ? __rdtsc() : 0;
+                const auto op_lap = [&op_t](DrawPhases::Phase p) {
+                    if (op_t) {
+                        const u64 now = __rdtsc();
+                        DrawPhases::Add(p, now - op_t);
+                        op_t = now;
+                    }
+                };
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                op_lap(DrawPhases::CClamp);
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
@@ -3508,8 +3544,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     !desc.is_written) {
                     buffer_cache.ForceUpload(vsharp.base_address, size);
                 }
+                if (op_t) op_t = __rdtsc();
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                op_lap(DrawPhases::CObtain);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -3523,11 +3561,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     checkpoint_buffers[num_checkpoint_buffers++] = {
                         vsharp.base_address, static_cast<u32>(size), desc.is_written};
                 }
+                if (op_t) op_t = __rdtsc();
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
+                op_lap(DrawPhases::CInvalidate);
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                op_lap(DrawPhases::CAccess);
                 if (const VAddr watch = WatchedGpuWrite();
                     watch && desc.is_written && vsharp.base_address < watch + 0x1000 &&
                     watch < vsharp.base_address + size) {
