@@ -1630,6 +1630,19 @@ void TextureCache::TouchImage(const Image& image) {
     if (image.lru_touched_tick == gc_tick) {
         return;
     }
+    // bbport: an unregistered image's LRU entry is free: touching it linked the free entry
+    // back into the list, and when it was reused the list closed on itself and
+    // GarbageCollectImages spun forever (the GPU thread stopped, "Kick failed to complete").
+    if (False(image.flags & ImageFlagBits::Registered)) {
+        static std::atomic<u32> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
+            std::printf("Texture cache: touch of an unregistered image %ux%u %s at %#llx ignored\n",
+                        image.info.size.width, image.info.size.height,
+                        vk::to_string(image.info.pixel_format).c_str(),
+                        static_cast<unsigned long long>(image.info.guest_address));
+        }
+        return;
+    }
     image.lru_touched_tick = gc_tick;
     lru_cache.Touch(image.lru_id, gc_tick);
 }

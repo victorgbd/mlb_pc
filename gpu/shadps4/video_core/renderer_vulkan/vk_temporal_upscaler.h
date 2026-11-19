@@ -79,10 +79,15 @@ public:
     /// pass. Before it, frame generation takes the scene depth and zero motion vectors (FSR 3.1
     /// interpolates with its own optical flow); the frame is interpolated with its UI.
     void OnFrameGenPass(u64 ps_hash);
-    /// The scene depth is found without a velocity pass (BB_FRAME_GEN_PS set).
-    [[nodiscard]] bool SceneDepthMode() const noexcept {
-        return frame_gen_ps != 0;
-    }
+    /// The scene depth is found without a velocity pass (BB_FRAME_GEN_PS set, or MLB's
+    /// view-projection camera).
+    [[nodiscard]] bool SceneDepthMode() const noexcept;
+    /// bbport: BB_MLB_TEMPORAL=1: the game's final pass into the display buffer (MLB: scene,
+    /// bloom and UI composed in one draw) reads the scene color: upscale it before that pass.
+    void OnFinalPass();
+    /// A resolve of `src` into `dst`: MLB resolves its 4x MSAA scene color into the image the
+    /// post-processing and the final pass read; that image is upscaled right after.
+    void OnResolve(VAddr src, VideoCore::ImageId dst);
 
     /// Start of a frame in the command stream (display pass).
     bool OnFrameStart();
@@ -310,6 +315,11 @@ private:
     vk::UniqueDescriptorSetLayout reactive_desc_layout;
     vk::UniquePipelineLayout reactive_pipeline_layout;
     vk::UniquePipeline reactive_pipeline;
+    VideoCore::UniqueImage depth_resolved_image; ///< R32F: sample 0 of an MSAA scene depth
+    vk::UniqueImageView depth_resolved_view;
+    vk::UniqueDescriptorSetLayout depth_resolve_desc_layout;
+    vk::UniquePipelineLayout depth_resolve_pipeline_layout;
+    vk::UniquePipeline depth_resolve_pipeline;
     vk::UniqueDescriptorSetLayout merge_desc_layout;
     vk::UniquePipelineLayout merge_pipeline_layout;
     vk::UniquePipeline merge_pipeline;

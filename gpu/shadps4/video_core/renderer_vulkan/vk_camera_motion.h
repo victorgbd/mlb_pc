@@ -29,7 +29,7 @@ public:
     CameraMotion(const Instance& instance, Scheduler& scheduler,
                  VideoCore::TextureCache& texture_cache, Runtime& runtime);
     ~CameraMotion();
-    void InvalidateHistory() { current.valid = previous.valid = false; }
+    void InvalidateHistory() { current.valid = previous.valid = vp_last.valid = false; }
     void SetObjectMotion(ObjectMotion* motion) noexcept {
         object_motion = motion;
     }
@@ -49,9 +49,22 @@ public:
     /// Both cameras and the scene depth of the current frame are known; in VelocityMode the
     /// velocity pass's camera and the scene depth.
     [[nodiscard]] bool Ready() const noexcept {
-        return velocity_mode ? velocity_camera.valid && depth_id
-                             : current.valid && previous.valid && depth_id;
+        return velocity_mode || vp_mode ? velocity_camera.valid && depth_id
+                                        : current.valid && previous.valid && depth_id;
     }
+    /// bbport: BB_MLB_TEMPORAL=1 (MLB The Show 24, a forward renderer): the camera is the
+    /// view-projection matrix its scene vertex shaders bind (OnViewProjection); the motion
+    /// vectors are recorded like the velocity pass's (RecordVelocity) from this and the
+    /// previous frame's matrix.
+    [[nodiscard]] bool ViewProjectionMode() const noexcept {
+        return vp_mode;
+    }
+    /// A 128-byte vertex shader constant buffer of a scene draw: the view-projection matrix
+    /// (16 floats, column-major) and a world matrix. The first one of a frame that passes the
+    /// perspective test is the camera. `y_up`: the viewport maps clip +y to the top.
+    void OnViewProjection(const float* matrix, bool y_up);
+    /// Far plane of the current camera (3000 for Bloodborne, 10000 for Uncharted).
+    [[nodiscard]] float Far() const noexcept;
     /// bbport: BB_VELOCITY_PS=<pixel shader hash,...> (Uncharted): the game's camera velocity
     /// pass (for its motion blur). Its constants give this frame's view from depth and the
     /// previous frame's projection (OnVelocityConstants); no scene constants are needed then.
@@ -66,7 +79,8 @@ public:
     /// Records the motion vector pass from the velocity pass's camera into `motion_view`
     /// (RG16F storage, General), pixels, previous minus current; zero without that camera.
     void RecordVelocity(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
-                        vk::ImageView motion_view, u32 width, u32 height);
+                        vk::ImageView motion_view, u32 width, u32 height,
+                        vk::ImageView object_view = {});
     [[nodiscard]] VideoCore::ImageId Depth() const noexcept {
         return depth_id;
     }
@@ -123,6 +137,14 @@ private:
     std::array<u32, 2> render_size{};
     VideoCore::ImageId depth_id{};
     bool velocity_mode = false;
+    bool vp_mode = false;
+    /// View-projection mode: the last frame's camera (rows, double) and this frame's.
+    struct ViewProjection {
+        std::array<double, 16> rows{};
+        bool valid = false;
+    };
+    ViewProjection vp_last, vp_frame;
+    float vp_far = 0.0f;
     std::vector<u64> velocity_shaders;
     /// The velocity pass's camera this frame: view position from depth and uv, and the 3x4
     /// view to previous clip (x, y, w rows).

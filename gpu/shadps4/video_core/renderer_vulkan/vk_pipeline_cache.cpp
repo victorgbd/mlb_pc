@@ -931,15 +931,38 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     // Only potentially animated G-buffer draws may use the extra motion attachment. The
     // ordinary stage variant is needed first to inspect the vertex shader's resources.
     bool motion_possible = false;
+    bool mlb_scene_pass = false;
     {
         u32 bound = 0;
         for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
             bound += (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) ? 1 : 0;
         }
-        motion_possible = Shader::MotionVectors::positions_address != 0 && bound >= 5 &&
+        // MLB (forward, 4x MSAA): any color pass drawn with the scene depth.
+        const u64 scene_depth = Shader::MotionVectors::scene_depth_address;
+        bool scene_pass = scene_depth != 0 && bound >= 1 && regs.depth_buffer.DepthValid() &&
+                          regs.depth_buffer.DepthAddress() == scene_depth;
+        // Only passes whose targets are the depth's size: the attachment has the scene size
+        // (a smaller target with this depth recreated it and broke a quarter of the vectors).
+        for (s32 cb = 0; scene_pass && cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
+            const auto& col_buf = regs.color_buffers[cb];
+            if (col_buf && regs.color_target_mask.GetMask(cb) &&
+                // Heights are padded to the tiling (1920x1088 color, 1920x1152 depth).
+                (col_buf.Pitch() != regs.depth_buffer.Pitch() ||
+                 std::abs(s32(col_buf.Height()) - s32(regs.depth_buffer.Height())) >= 128)) {
+                static std::atomic<int> reported{0};
+                if (reported.fetch_add(1) < 8) {
+                    std::printf("Object motion: pass skipped, target %u %ux%u, depth %ux%u\n", cb,
+                                col_buf.Pitch(), col_buf.Height(), regs.depth_buffer.Pitch(),
+                                regs.depth_buffer.Height());
+                }
+                scene_pass = false;
+            }
+        }
+        mlb_scene_pass = scene_pass;
+        motion_possible = Shader::MotionVectors::positions_address != 0 &&
+                          (scene_pass || (bound >= 5 && regs.depth_buffer.NumSamples() == 1)) &&
                           !regs.color_buffers[Shader::MotionVectors::Output] &&
-                          regs.depth_buffer.DepthValid() &&
-                          regs.depth_buffer.NumSamples() == 1 && !regs.IsClipDisabled() &&
+                          regs.depth_buffer.DepthValid() && !regs.IsClipDisabled() &&
                           regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
     }
     sel.motion = false;
@@ -975,7 +998,12 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     }
     if (motion_possible) {
         const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
-        if (vs) {
+        // MLB: every scene pipeline; the rasterizer gives history only to draws whose bone
+        // palette changes or whose vertices the GPU wrote (simulated cloth).
+        if (vs && mlb_scene_pass) {
+            sel.motion = true;
+        }
+        if (vs && !sel.motion) {
             // Shaders with a bone palette (motion_history.h). Small skeletons (weapons,
             // props) also include static world pieces: the rasterizer gives those
             // history only while their constants change.
@@ -1065,7 +1093,14 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         color_buffer.swizzle = AmdGpu::IdentityMapping;
         key.write_masks[mv] = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                               vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
-        key.color_samples[mv] = 1;
+        // MLB: every scene pipeline carries the attachment; draws that write no depth
+        // (effects, transparents, full-screen passes) hide nothing and keep the vectors under
+        // them (one erased a quarter of the screen).
+        if (mlb_scene_pass && !regs.depth_control.depth_write_enable) {
+            key.write_masks[mv] = {};
+        }
+        // As many samples as the depth (MLB's scene is 4x MSAA; G-buffers have one).
+        key.color_samples[mv] = u8(std::max<u32>(1, key.depth_samples));
     }
 
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration
