@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/scene_resolution.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -49,6 +50,41 @@ std::array<float, 12> Multiply(const std::array<float, 12>& a, const std::array<
     return out;
 }
 
+/// Inverse of a 4x4 matrix (rows); false when singular.
+bool Invert(const std::array<double, 16>& m, std::array<double, 16>& out) {
+    std::array<double, 32> a{};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            a[r * 8 + c] = m[r * 4 + c];
+        }
+        a[r * 8 + 4 + r] = 1.0;
+    }
+    for (int c = 0; c < 4; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < 4; ++r) {
+            if (std::abs(a[r * 8 + c]) > std::abs(a[pivot * 8 + c])) pivot = r;
+        }
+        if (std::abs(a[pivot * 8 + c]) < 1e-12) return false;
+        if (pivot != c) {
+            for (int k = 0; k < 8; ++k) std::swap(a[c * 8 + k], a[pivot * 8 + k]);
+        }
+        const double inv = 1.0 / a[c * 8 + c];
+        for (int k = 0; k < 8; ++k) a[c * 8 + k] *= inv;
+        for (int r = 0; r < 4; ++r) {
+            if (r == c) continue;
+            const double f = a[r * 8 + c];
+            if (f == 0.0) continue;
+            for (int k = 0; k < 8; ++k) a[r * 8 + k] -= f * a[c * 8 + k];
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = a[r * 8 + 4 + c];
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
@@ -73,6 +109,11 @@ CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
     if (velocity_mode) {
         std::printf("Camera motion: from the game's velocity pass (%zu shaders)\n",
                     velocity_shaders.size());
+    }
+    const char* temporal = std::getenv("BB_MLB_TEMPORAL");
+    vp_mode = for_upscaler && !velocity_mode && temporal && temporal[0] == '1';
+    if (vp_mode) {
+        std::printf("Camera motion: from the scene's view-projection matrix (MLB)\n");
     }
     const auto device = instance.GetDevice();
     if (for_upscaler) {
@@ -176,6 +217,96 @@ float CameraMotion::VerticalFov() const noexcept {
     return 2.0f * std::atan(1.0f / current.proj[1]);
 }
 
+float CameraMotion::Far() const noexcept {
+    if (vp_mode && vp_far > 0.0f) return vp_far;
+    return velocity_mode ? 10000.0f : 3000.0f;
+}
+
+void CameraMotion::OnViewProjection(const float* m, bool y_up) {
+    if (!vp_mode || vp_frame.valid) {
+        return; // the first one of a frame is the main camera
+    }
+    // Column-major: element (row r, column c) at m[c * 4 + r].
+    std::array<double, 16> rows{};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            rows[r * 4 + c] = m[c * 4 + r];
+        }
+    }
+    const auto norm3 = [&](int r) {
+        return std::sqrt(rows[r * 4] * rows[r * 4] + rows[r * 4 + 1] * rows[r * 4 + 1] +
+                         rows[r * 4 + 2] * rows[r * 4 + 2]);
+    };
+    // A perspective camera: row w is the unit view direction (w = view depth), and rows x and y
+    // scale by the aspect (|x| / |y| = height / width of the game's size).
+    const double nx = norm3(0), ny = norm3(1), nw = norm3(3);
+    const auto& native = SceneResolution::Native();
+    const double aspect = double(native.height) / native.width;
+    if (!std::isfinite(nx + ny + nw) || std::abs(nw - 1.0) > 1e-3 || ny < 0.1 ||
+        std::abs(nx / ny / aspect - 1.0) > 0.02) {
+        return;
+    }
+    // Row z = a row w + b (depth = a + b / w): a D3D projection, near -b/a, far b/(1-a).
+    const double a = rows[8] * rows[12] + rows[9] * rows[13] + rows[10] * rows[14];
+    const double b = rows[11] - a * rows[15];
+    const double residual = std::abs(rows[8] - a * rows[12]) + std::abs(rows[9] - a * rows[13]) +
+                            std::abs(rows[10] - a * rows[14]);
+    if (residual > 1e-3 * std::abs(a) || a == 0.0 || b >= 0.0) {
+        return;
+    }
+    vp_frame.rows = rows;
+    vp_frame.valid = true;
+    current.proj = {float(nx), float(ny), float(a), float(b)}; // Near() and VerticalFov()
+    vp_far = a > 1.0 ? float(b / (1.0 - a)) : 0.0f;
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        std::printf("Camera motion: view-projection camera found (y scale %.3f, near %.2f, far "
+                    "%.1f, clip y %s)\n",
+                    ny, -b / a, vp_far, y_up ? "up" : "down");
+    }
+    // BB_CAMERA_LOG=1: each frame's camera (y scale, view direction row, last frame's known).
+    static const bool camera_log = std::getenv("BB_CAMERA_LOG") != nullptr;
+    if (camera_log) {
+        std::printf("Camera VP: y %.3f w (%.4f %.4f %.4f %.2f) previous %d\n", ny, rows[12],
+                    rows[13], rows[14], rows[15], int(vp_last.valid));
+    }
+    if (!vp_last.valid) {
+        return;
+    }
+    // View position (w ndc.x, w ndc.y, w, 1) -> current clip (N) -> world -> previous clip.
+    std::array<double, 16> inverse{};
+    if (!Invert(rows, inverse)) {
+        return;
+    }
+    std::array<double, 16> reproject{};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            double v = 0.0;
+            for (int k = 0; k < 4; ++k) v += vp_last.rows[r * 4 + k] * inverse[k * 4 + c];
+            reproject[r * 4 + c] = v;
+        }
+    }
+    // RecordVelocity's shader takes clip +y as up (previous uv.y = 0.5 - 0.5 y / w): with +y
+    // down, its output row y is negated. The view position below holds the true clip y.
+    const double y_sign = y_up ? 1.0 : -1.0;
+    auto& camera = velocity_camera;
+    constexpr std::array<int, 3> out_rows{0, 1, 3};
+    for (int i = 0; i < 3; ++i) {
+        const double* r = &reproject[out_rows[i] * 4];
+        const double s = i == 1 ? y_sign : 1.0;
+        camera.to_previous_clip[i * 4 + 0] = float(s * r[0]);
+        camera.to_previous_clip[i * 4 + 1] = float(s * r[1]);
+        camera.to_previous_clip[i * 4 + 2] = float(s * (a * r[2] + r[3]));
+        camera.to_previous_clip[i * 4 + 3] = float(s * b * r[2]);
+    }
+    // View x = z (2u - 1), view y = z (1 - 2v) with clip +y up (or z (2v - 1)); z = b / (depth - a).
+    camera.uv_to_view = {2.0f, float(-2.0 * y_sign), -1.0f, float(y_sign)};
+    camera.depth_to_z = {float(a), float(b)};
+    camera.valid = std::all_of(camera.to_previous_clip.begin(), camera.to_previous_clip.end(),
+                               [](float v) { return std::isfinite(v); });
+}
+
 float CameraMotion::Near() const noexcept {
     if (current.proj[2] == 0.0f) {
         return 0.1f;
@@ -201,6 +332,17 @@ vk::Image CameraMotion::ObjectMotionImage(u32 width, u32 height) const noexcept 
 
 void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
                                 vk::ImageView motion_view, u32 width, u32 height) {
+    if (vp_mode) {
+        // MLB: the camera from the view-projection matrices, object vectors where drawn.
+        bool objects_valid = false;
+        const vk::ImageView objects =
+            object_motion && object_motion->Enabled()
+                ? object_motion->PrepareRead(cmdbuf, width, height, objects_valid)
+                : vk::ImageView{};
+        RecordVelocity(cmdbuf, depth_view, motion_view, width, height,
+                       objects_valid ? objects : vk::ImageView{});
+        return;
+    }
     bool object_valid = false;
     const vk::ImageView object_view = object_motion && object_motion->Enabled()
         ? object_motion->PrepareRead(cmdbuf, width, height, object_valid) : depth_view;
@@ -313,7 +455,8 @@ void CameraMotion::OnVelocityConstants(const float* c, u32 dwords) {
 }
 
 void CameraMotion::RecordVelocity(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
-                                  vk::ImageView motion_view, u32 width, u32 height) {
+                                  vk::ImageView motion_view, u32 width, u32 height,
+                                  vk::ImageView object_view) {
     const auto& camera = velocity_camera;
     const PushConstants push{
         .reproject = camera.to_previous_clip,
@@ -322,14 +465,14 @@ void CameraMotion::RecordVelocity(vk::CommandBuffer cmdbuf, vk::ImageView depth_
         .size = {float(width), float(height)},
         .jitter = jitter,
         .previous_jitter = previous_jitter,
-        .mode = camera.valid ? 2u : 3u,
+        .mode = camera.valid ? (object_view ? 2u | 16u : 2u) : 3u,
     };
     const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
                                              .imageLayout = vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo motion_info{.imageView = motion_view,
                                               .imageLayout = vk::ImageLayout::eGeneral};
-    // Binding 2 (object motion) is not read in these modes.
-    const vk::DescriptorImageInfo velocity_info{.imageView = depth_view,
+    // Binding 2: object motion (MLB), else not read in these modes.
+    const vk::DescriptorImageInfo velocity_info{.imageView = object_view ? object_view : depth_view,
                                                 .imageLayout = vk::ImageLayout::eGeneral};
     const std::array<vk::WriteDescriptorSet, 3> writes = {{
         {.dstBinding = 0,
@@ -387,6 +530,9 @@ void CameraMotion::OnDisplayPass(VideoCore::ImageId frame) {
     frame_has_camera = false;
     depth_id = {};
     velocity_camera.valid = false;
+    // View-projection mode: this frame's camera is the next frame's previous one.
+    vp_last = vp_frame;
+    vp_frame.valid = false;
 }
 
 void CameraMotion::Overlay(VideoCore::ImageId frame) {

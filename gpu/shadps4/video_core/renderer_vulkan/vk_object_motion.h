@@ -42,8 +42,9 @@ public:
         return index_ranges.Get(key, frame, scan);
     }
 
-    /// Rendering of a motion pipeline: the motion attachment (render-target size).
-    void Attach(RenderState& state, u32 width, u32 height);
+    /// Rendering of a motion pipeline: the motion attachment (render-target size, and the
+    /// depth's sample count: 4 for MLB's MSAA scene).
+    void Attach(RenderState& state, u32 width, u32 height, u32 samples = 1);
 
     /// Start of a frame (display pass).
     void OnFrameStart();
@@ -52,17 +53,19 @@ public:
     /// The motion image for the compose pass (layout General after this call) and whether it
     /// holds this frame's vectors at `width` x `height`.
     vk::ImageView PrepareRead(vk::CommandBuffer cmdbuf, u32 width, u32 height, bool& valid);
-    /// The image of the last PrepareRead (layout General), or null.
+    /// The image of the last PrepareRead (layout General, one sample), or null.
     [[nodiscard]] vk::ImageView View() const noexcept {
+        if (image_samples > 1) return resolved_view ? *resolved_view : vk::ImageView{};
         return view ? *view : vk::ImageView{};
     }
     [[nodiscard]] vk::Image Image(u32 width, u32 height) const noexcept {
-        return written && width == image_width && height == image_height
-            ? vk::Image(image) : vk::Image{};
+        if (!written || width != image_width || height != image_height) return vk::Image{};
+        return image_samples > 1 ? vk::Image(resolved_image) : vk::Image(image);
     }
 
 private:
-    void EnsureImage(u32 width, u32 height);
+    void EnsureImage(u32 width, u32 height, u32 samples);
+    void CreateResolvePipeline();
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -87,7 +90,13 @@ private:
     u32 params_used = 0;
     VideoCore::UniqueImage image;
     vk::UniqueImageView view;
-    u32 image_width = 0, image_height = 0;
+    u32 image_width = 0, image_height = 0, image_samples = 1;
+    /// MSAA attachment (MLB): sample 0 of each pixel, for the compose pass (motion_resolve).
+    VideoCore::UniqueImage resolved_image;
+    vk::UniqueImageView resolved_view;
+    vk::UniqueDescriptorSetLayout resolve_desc_layout;
+    vk::UniquePipelineLayout resolve_pipeline_layout;
+    vk::UniquePipeline resolve_pipeline;
     bool written = false; ///< this frame's vectors are in the image
     vk::ImageLayout image_layout = vk::ImageLayout::eUndefined;
 };

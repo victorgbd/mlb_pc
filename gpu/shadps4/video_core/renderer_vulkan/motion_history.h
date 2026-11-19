@@ -215,6 +215,8 @@ struct Draw {
     uint64_t shader{}, geometry{}, indices{}, topology{};
     uint32_t index_count{}, instances{}, first_instance{};
     VertexRange vertices;
+    /// bbport (MLB): identity of the streams the GPU did not write; 0 = none (no loose match).
+    uint64_t stable{};
     bool operator==(const Draw& rhs) const = default;
 };
 
@@ -229,7 +231,12 @@ public:
     };
     struct Stats {
         uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{};
+        uint64_t loose{}; ///< loaded through the key without the vertex streams
     } stats;
+    /// bbport (MLB): a draw whose vertex streams changed since last frame (MLB rewrites the
+    /// normals and tangents of skinned meshes into a new place every frame) is matched by its
+    /// streams the GPU did not write (Draw::stable), index list, topology, offsets and order.
+    bool loose_geometry = false;
 
     // A small skeleton (weapon, prop; most are static world pieces) only needs history
     // while its bone palette changes: with last frame's bones its motion is the camera's.
@@ -254,6 +261,10 @@ public:
         previous.swap(current);
         current.clear();
         occurrences.clear();
+        loose_previous.swap(loose_current);
+        loose_current.clear();
+        loose_previous_occurrences.swap(loose_occurrences);
+        loose_occurrences.clear();
         gate_previous.swap(gate_current);
         gate_current.clear();
         gate_occurrences.clear();
@@ -272,6 +283,25 @@ public:
             return {};
         }
         const auto* prev = previous.find(key);
+        Key loose_key{draw, 0};
+        if (loose_geometry && draw.stable) {
+            loose_key.draw.geometry = draw.stable;
+            loose_key.draw.stable = 0;
+            loose_key.occurrence = loose_occurrences[loose_key]++;
+            if (!prev) {
+                // Only GPU-written streams (Draw::stable bit 1): just a layout, so only a
+                // draw that was alone with it last frame is trusted.
+                bool trusted = true;
+                if (draw.stable & 2) {
+                    Key count_key = loose_key;
+                    count_key.occurrence = 0;
+                    const auto* count = loose_previous_occurrences.find(count_key);
+                    trusted = loose_key.occurrence == 0 && count && *count == 1;
+                }
+                prev = trusted ? loose_previous.find(loose_key) : nullptr;
+                stats.loose += prev ? 1 : 0;
+            }
+        }
         Allocation result{0, 0, draw.vertices.count, draw.instances,
                           draw.vertices.first, draw.first_instance};
         if (prev) {
@@ -284,6 +314,9 @@ public:
             result.store = 1 + uint32_t(frame & 1) * capacity + used;
             used += uint32_t(count);
             current.emplace(key, result.store);
+            if (loose_geometry && draw.stable) {
+                loose_current.emplace(loose_key, result.store);
+            }
             ++stats.stored;
         } else {
             ++stats.exhausted;
@@ -313,6 +346,8 @@ private:
     uint32_t capacity{}, used{};
     uint64_t frame{};
     FlatMap<Key, uint32_t, Hash> previous, current, occurrences;
+    FlatMap<Key, uint32_t, Hash> loose_previous, loose_current, loose_occurrences,
+        loose_previous_occurrences;
     struct GateHash {
         size_t operator()(const GateKey& key) const {
             uint64_t h = 0;

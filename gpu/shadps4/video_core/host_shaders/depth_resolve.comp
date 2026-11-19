@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: a multisampled image (MLB The Show 24 draws its scene with 4x MSAA) as one sample per
+// pixel for the temporal upscalers and the camera motion vectors: sample 0 of each pixel. The
+// scene depth (R32F out), or with MOTION the object motion attachment (RGBA32F: vector, valid,
+// depth), so both keep the same sample.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2DMS source_ms;
+#ifdef MOTION
+layout(binding = 1, rgba32f) uniform writeonly image2D resolved;
+#else
+layout(binding = 1, r32f) uniform writeonly image2D resolved;
+#endif
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(resolved)))) {
+        return;
+    }
+    imageStore(resolved, pixel, texelFetch(source_ms, pixel, 0));
+}

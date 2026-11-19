@@ -23,6 +23,7 @@
 #include <chrono>
 #include "ffx_vk_portable.h"
 #include "video_core/host_shaders/upscale_merge_comp.h"
+#include "video_core/host_shaders/depth_resolve_comp.h"
 #include "video_core/host_shaders/upscale_reactive_comp.h"
 #include "video_core/host_shaders/taa_comp.h"
 #include "video_core/host_shaders/taa_sharpen_comp.h"
@@ -398,7 +399,10 @@ bool TemporalUpscaler::OnFrameStart() {
     const int preset = camera_motion.VelocityMode() ? 0 : BbSettings::RenderPreset();
     if (applied_preset != preset || settings.upscaler == BbSettings::UpscalerOff) failed = false;
     const bool active = Active();
-    const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
+    // Frame generation's scene depth alone (BB_FRAME_GEN_PS without MLB's camera) has no
+    // upscale to undo the jitter.
+    const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25) &&
+                           !(frame_gen_ps && !camera_motion.ViewProjectionMode());
     const int upscaler = settings.upscaler.load();
     const int output =
         camera_motion.VelocityMode() ? BbSettings::OutputDefault : settings.output_res.load();
@@ -471,6 +475,61 @@ bool TemporalUpscaler::OnFrameStart() {
     jitter_index = jitter_index % phases + 1;
     jitter = {Halton(jitter_index, 2) - 0.5f, Halton(jitter_index, 3) - 0.5f};
     return changed;
+}
+
+bool TemporalUpscaler::SceneDepthMode() const noexcept {
+    return frame_gen_ps != 0 || camera_motion.ViewProjectionMode();
+}
+
+void TemporalUpscaler::OnResolve(VAddr src, VideoCore::ImageId dst) {
+    if (!camera_motion.ViewProjectionMode() || done_this_frame || !scene_color || !dst) {
+        return;
+    }
+    const auto& color = texture_cache.GetImage(scene_color);
+    if (color.info.guest_address != src) {
+        return;
+    }
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        const auto& resolved = texture_cache.GetImage(dst);
+        std::printf("Upscaler: scene color %#llx (%u samples) resolved into %#llx: upscaled "
+                    "there\n",
+                    static_cast<unsigned long long>(src), color.info.num_samples,
+                    static_cast<unsigned long long>(resolved.info.guest_address));
+    }
+    // The post-processing and the final pass read the resolved image.
+    scene_color = dst;
+    OnFinalPass();
+}
+
+void TemporalUpscaler::OnFinalPass() {
+    if (!camera_motion.ViewProjectionMode() || done_this_frame || failed || Scaled()) {
+        return;
+    }
+    done_this_frame = true;
+    // Why it runs or not, logged when that changes (at most 64 times).
+    const bool run = scene_color && camera_motion.Ready() && Active();
+    const u32 state = u32(bool(scene_color)) | u32(bool(camera_motion.Depth())) << 1 |
+                      u32(camera_motion.Ready()) << 2 | u32(Active()) << 3;
+    static u32 last_state = ~0u;
+    static int reports = 0;
+    if (state != last_state && reports < 64) {
+        ++reports;
+        last_state = state;
+        if (run) {
+            std::printf("Upscaler: running on the scene color (MLB)\n");
+        } else {
+            std::printf("Upscaler: not run (scene color %d, depth %d, camera %d, active %d)\n",
+                        int(bool(scene_color)), int(bool(camera_motion.Depth())),
+                        int(camera_motion.Ready()), int(Active()));
+        }
+    }
+    if (!run) {
+        reset = true;
+        return;
+    }
+    Run();
 }
 
 void TemporalUpscaler::OnDispatch(u64 cs_hash) {
@@ -639,6 +698,9 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                    vk::ImageUsageFlagBits::eTransferSrc);
     make_image(reactive_image, reactive_view, vk::Format::eR8Unorm,
                vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
+    // MSAA scene depth (MLB) resolved to one sample (sample 0), at the render size.
+    make_image(depth_resolved_image, depth_resolved_view, vk::Format::eR32Sfloat,
+               vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
     for (u32 i = 0; i < taa_history.size(); ++i) {
         taa_history_views[i].reset();
         taa_history[i] = VideoCore::UniqueImage{};
@@ -749,6 +811,29 @@ void TemporalUpscaler::CreatePipelines() {
         }));
     }
     merge_pipeline = compute(UPSCALE_MERGE_COMP, *merge_pipeline_layout);
+    {
+        // Depth resolve (MSAA scene depth, MLB): the sampled depth, then the R32F storage image.
+        const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
+            {.binding = 0,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        }};
+        depth_resolve_desc_layout = Check(device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = u32(bindings.size()),
+            .pBindings = bindings.data(),
+        }));
+        depth_resolve_pipeline_layout = Check(device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = &*depth_resolve_desc_layout,
+        }));
+        depth_resolve_pipeline = compute(DEPTH_RESOLVE_COMP, *depth_resolve_pipeline_layout);
+    }
     storage_layout(3, reactive_desc_layout, reactive_pipeline_layout, 3 * sizeof(float));
     reactive_pipeline = compute(UPSCALE_REACTIVE_COMP, *reactive_pipeline_layout);
     storage_layout(2, taa_sharpen_desc_layout, taa_sharpen_pipeline_layout, sizeof(float));
@@ -1154,16 +1239,31 @@ void TemporalUpscaler::Run() {
     const bool reduced = ReducedScene(color) && scene_targets.EligibleScene(depth);
     const u32 w = reduced ? scene_targets.Size().width : ow;
     const u32 h = reduced ? scene_targets.Size().height : oh;
+    // A multisampled color has no storage view: MLB's is upscaled after its resolve.
     if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         depth.info.size.width != ow || depth.info.size.height != oh ||
-        !(color.usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        !(color.usage_flags & vk::ImageUsageFlagBits::eStorage) ||
+        color.backing->num_samples > 1) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::printf("Upscaler: scene color skipped (%s %ux%u, storage %d, %u samples; depth "
+                        "%ux%u)\n",
+                        vk::to_string(color.info.pixel_format).c_str(), ow, oh,
+                        int(bool(color.usage_flags & vk::ImageUsageFlagBits::eStorage)),
+                        color.backing->num_samples, depth.info.size.width,
+                        depth.info.size.height);
+        }
         return;
     }
     if (!EnsureResources(w, h, ow, oh, true)) {
         failed = true;
         return;
     }
-    const auto depth_format = depth.info.pixel_format;
+    auto depth_format = depth.info.pixel_format;
+    vk::ImageAspectFlags depth_aspect = vk::ImageAspectFlagBits::eDepth;
+    vk::ImageUsageFlags depth_usage = depth.usage_flags;
+    const bool depth_multisampled = !reduced && depth.backing->num_samples > 1;
     const auto depth_view =
         CachedView(depth, depth_format, vk::ImageAspectFlagBits::eDepth);
     const auto color_view =
@@ -1214,6 +1314,39 @@ void TemporalUpscaler::Run() {
                 vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
     own_barrier(vk::Image(output_image), vk::ImageLayout::eUndefined, all,
                 vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral, all, rw);
+    // MLB: the scene depth has 4 samples; the motion pass and the upscalers read sample 0 of
+    // each pixel from a one-sample R32F copy.
+    if (depth_multisampled) {
+        own_barrier(vk::Image(depth_resolved_image), vk::ImageLayout::eUndefined, all,
+                    vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite);
+        const vk::DescriptorImageInfo ms_info{.imageView = input_depth_view,
+                                              .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo out_info{.imageView = *depth_resolved_view,
+                                               .imageLayout = vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 2> writes = {{
+            {.dstBinding = 0,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .pImageInfo = &ms_info},
+            {.dstBinding = 1,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .pImageInfo = &out_info},
+        }};
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *depth_resolve_pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
+                                    *depth_resolve_pipeline_layout, 0, writes);
+        cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        own_barrier(vk::Image(depth_resolved_image), vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                    vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
+        input_depth = vk::Image(depth_resolved_image);
+        input_depth_view = *depth_resolved_view;
+        depth_format = vk::Format::eR32Sfloat;
+        depth_aspect = vk::ImageAspectFlagBits::eColor;
+        depth_usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+    }
 
     if (camera_motion.VelocityMode()) {
         camera_motion.RecordVelocity(cmdbuf, input_depth_view, *motion_view, w, h);
@@ -1244,13 +1377,13 @@ void TemporalUpscaler::Run() {
         dispatched = RecordDlss(
             cmdbuf,
             {input_color, input_color_view, color.info.pixel_format, vk::ImageAspectFlagBits::eColor, w, h},
-            {input_depth, input_depth_view, depth_format, vk::ImageAspectFlagBits::eDepth, w, h}, w, h,
+            {input_depth, input_depth_view, depth_format, depth_aspect, w, h}, w, h,
             ow, oh, frame_ms, true);
     } else if (UseXess()) {
         dispatched = RecordXess(
             cmdbuf,
             {input_color, input_color_view, color.info.pixel_format, vk::ImageAspectFlagBits::eColor, w, h},
-            {input_depth, input_depth_view, depth_format, vk::ImageAspectFlagBits::eDepth, w, h}, w, h,
+            {input_depth, input_depth_view, depth_format, depth_aspect, w, h}, w, h,
             ow, oh, true);
     } else {
         FfxVkPortableUpscaleDispatchInfo info{};
@@ -1259,8 +1392,8 @@ void TemporalUpscaler::Run() {
         info.color = Describe(input_color, color.info.pixel_format, w, h,
                               color.usage_flags, vk::ImageAspectFlagBits::eColor,
                               FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
-        info.depth = Describe(input_depth, depth_format, w, h, depth.usage_flags,
-                              vk::ImageAspectFlagBits::eDepth,
+        info.depth = Describe(input_depth, depth_format, w, h, depth_usage,
+                              depth_aspect,
                               FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
         info.motionVectors = Describe(vk::Image(motion_image), vk::Format::eR16G16Sfloat, w, h,
                                       vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
@@ -1291,7 +1424,7 @@ void TemporalUpscaler::Run() {
         info.frameTimeMilliseconds = frame_ms;
         info.preExposure = 1.0f;
         info.cameraNear = camera_motion.Near();
-        info.cameraFar = camera_motion.VelocityMode() ? 10000.0f : 3000.0f;
+        info.cameraFar = camera_motion.Far();
         info.cameraVerticalFovRadians = camera_motion.VerticalFov();
         info.viewSpaceToMeters = 1.0f;
         // RCAS strength 0..1 (menu, BB_FSR_SHARPNESS); jitter at 1:1 softens the image slightly.
@@ -1324,6 +1457,17 @@ void TemporalUpscaler::Run() {
     if (dispatched) {
         reset = false;
         dispatched_last_frame = true;
+        // BB_DUMP_TRIGGER (see DumpFrame): the inputs and the result, before the merge.
+        if (const int dump = DumpFrame(); dump >= 0) {
+            DumpImages(instance, scheduler, cmdbuf, dump,
+                       {{input_color, w, h, 8, "input", "rgba16f"},
+                        {vk::Image(motion_image), w, h, 4, "motion", "rg16f"},
+                        {vk::Image(output_image), ow, oh, 8, "output", "rgba16f"}});
+            if (depth_multisampled) {
+                DumpImages(instance, scheduler, cmdbuf, dump,
+                           {{input_depth, w, h, 4, "depth", "f32"}});
+            }
+        }
         if (BbSettings::Get().upscaler != BbSettings::UpscalerTaa) {
             ExtraSharpen(cmdbuf, vk::Image(output_image), false, ow, oh);
         }
@@ -1951,7 +2095,7 @@ void TemporalUpscaler::RunScaled() {
     info.frameTimeMilliseconds = frame_ms;
     info.preExposure = 1.0f;
     info.cameraNear = camera_motion.Near();
-    info.cameraFar = 3000.0f;
+    info.cameraFar = camera_motion.Far();
     info.cameraVerticalFovRadians = camera_motion.VerticalFov();
     info.viewSpaceToMeters = 1.0f;
     info.sharpness = std::min(settings.sharpness.load(), 1.0f);
@@ -2173,7 +2317,7 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
         .jitter = {sign * jitter[0], sign * jitter[1]},
         .frame_ms = frame_ms,
         .near_plane = camera_motion.Near(),
-        .far_plane = 3000.0f,
+        .far_plane = camera_motion.Far(),
         .vertical_fov = camera_motion.VerticalFov(),
         .sharpness = std::min(settings.sharpness.load(), 1.0f),
         .sharpen = settings.sharpen,

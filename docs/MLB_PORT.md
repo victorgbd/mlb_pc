@@ -322,6 +322,72 @@ them.
     bloom (512x512) and the UI (its own RGBA8 target) into the display buffer. The temporal
     upscalers' trigger (compute 9a9cf8a9, Bloodborne's) never runs in MLB: the "FSR 3.1" shown
     by the FPS counter does nothing.
+  - Camera (found 2026-11-18 in frame captures, `BB_CAPTURE_TRIGGER`): the scene's vertex shaders
+    (4f5afe70, 9ef15ce2, 8b9c253b, ... slot 11 or 12) bind a 128-byte constant buffer =
+    view-projection (16 floats, column-major) + world matrix (16 floats). The VP is the same for
+    every scene draw of a frame; test: |row x| / |row y| = 1080/1920 and |row w xyz| = 1. Depth
+    is not reversed (D3D 0..1): z row = 1.01005 w row - 100.5, so near about 100, far about
+    10000 game units. The pitch camera is a telephoto (P11 = 27.2, vertical FOV about 4 degrees)
+    that stays still for long stretches; the intro uses P11 = 1.77. Pass #72 (2104x1184 target)
+    has the same camera at 1920/2104 of the scale. The world matrix of that block is the identity
+    for the stadium. The UI uses its own pixel-space matrix (P11 = -1.7778, -960/960).
+    Search scripts: vpfind.py / vpstats.py (row-norm test over the capture's buffers).
+  - Characters (confirmed 2026-11-18 with `BB_CAPTURE_VSBUF=1`, which notes every draw's vertex
+    shader buffers in a capture): skinned in the vertex shader. Each draw gets its part of the
+    bone palette in a constant buffer of 4x4 world-space bone matrices (rotation + translation,
+    row 3 = position): 192 bytes = 3 bones, 1728 bytes = 27 bones (shaders a01311cb, 306b55fd,
+    281decad, 7b17c70e, 44dcb85c, ...). Compute 3722f2a7 only rotates a packed vector by the
+    blended bones (no translation): normals/tangents, not positions. Object motion vectors
+    therefore need the previous frame's bone palette of the same draw and a vertex shader that
+    transforms the vertex with both. The crowd (5703a1b5, 01da6d6b, 769bf6cf) decodes
+    bit-packed vertices from a 5 MB buffer.
+  - Temporal upscaler, camera motion only (2026-11-18, opt-in `BB_MLB_TEMPORAL=1`; the menu's
+    anti-aliasing choice picks FSR 3/4, DLSS or XeSS). The launcher's Display page sets it up
+    with **Temporal anti-aliasing** (`temporal_aa`: off/fsr3/dlss/xess, DLSS and XeSS listed only
+    when their DLLs are beside the loader): `BB_MLB_TEMPORAL=1`, `BB_UPSCALER`,
+    `BB_UPSCALE_PRESET=0`, and the render resolution is ignored while it is on. The scene is drawn with **4x MSAA** (color
+    0x80e5dc0000 and depth D32S8, 4 samples) and a CB resolve copies the color into a one-sample
+    image (0x80e4dd0000) that the bloom and the final pass read. `Rasterizer::Resolve` calls
+    `TemporalUpscaler::OnResolve`, which upscales that resolved image in place;
+    depth_resolve.comp copies sample 0 of the MSAA depth into an R32F image for the motion pass
+    and the upscalers. Camera: `CameraMotion::OnViewProjection` takes the first 128-byte
+    vertex shader constant buffer of a frame's scene draws that passes the perspective test and
+    builds previous-clip-from-current-clip for camera_motion.comp's mode 2 (math checked against a
+    synthetic camera: exact). Scene draws get the jitter through the viewport. Seen on a GTX 1650:
+    correct and sharp with the pitch camera; ghosting on moving players in close-ups (fixed by the object
+    motion vectors below); FSR 3 at 1920x1080 costs about 3-4 FPS. The scene stays at the
+    native size (MSAA passes are not drawn into reduced proxies), so it is anti-aliasing only for
+    now. The port's own TAA still uses Bloodborne's camera for its depth test (not adapted).
+  - Object motion vectors (2026-11-18, with `BB_MLB_TEMPORAL=1` and the menu's character
+    motion vectors on): the port's ObjectMotion (vertex shaders store each vertex's clip position
+    and read last frame's; the fragment shader writes the difference) now runs on MLB:
+    - Selection: every pipeline drawing with the scene depth (address published by the
+      rasterizer in `MotionVectors::scene_depth_address`) whose targets have the depth's pitch
+      (heights are padded differently: 1920x1088 color, 1920x1152 depth). Pipelines that write
+      no depth get a zero write mask on the motion attachment (a full-screen pass erased a
+      quarter of the vectors).
+    - MSAA: the attachment takes the depth's 4 samples; `ObjectMotion::PrepareRead` copies
+      sample 0 into a one-sample image (motion_resolve, depth_resolve.comp with MOTION), and
+      camera_motion.comp's mode 2 takes the object vector where it is valid and its depth
+      matches (bit 16 of mode).
+    - Matching across frames: MLB rewrites the normals/tangents of skinned meshes into a new place
+      every frame, so the vertex-stream hash never matched. `Draw::stable` hashes only the streams
+      the GPU did not write; a draw with only GPU-written streams (simulated cloth) is matched
+      by their layout when it was alone with it last frame. Non-indexed quads with CPU-written
+      vertices and meshes whose index lists change per draw (5fb82e05) stay unmatched (camera).
+    - Gate: draws are instrumented only while their bone palette changes, or always when they read
+      GPU-written vertices (cloth moves with an unchanged palette). Static stadium pieces keep
+      the camera's vectors.
+    - Result on the GTX 1650: players, cloth and the mound get their own vectors (debug view),
+      no ghosting seen in a FANCAM pan; about 3 FPS more than camera-only. The crowd (packed
+      vertices) keeps the camera's vectors. `BB_MOTION_UNMATCHED_LOG=1` lists the draws with
+      and without history in two frames every 1200.
+  - Fixed 2026-11-18: `TextureCache::TouchImage` on an unregistered image (a 512x512 RGBA16F bloom
+    target evicted under memory pressure) relinked its free LRU entry; once reused, the list closed
+    on itself and `GarbageCollectImages` spun forever (the GPU thread stopped, "Kick failed to
+    complete"). Seen on the 4 GB GTX 1650 in a match when the upscaler's ~100 MB pushed the texture
+    cache over its budget; any memory pressure can do it. Touches of unregistered images are now
+    ignored (logged).
   - The resolution patch (`BB_GAME_RES`) finds no display configuration in MLB
     ("0 stores changed").
   - Frame generation without a velocity pass: `BB_FRAME_GEN=fsr3 BB_FRAME_GEN_PS=c684cde1` takes

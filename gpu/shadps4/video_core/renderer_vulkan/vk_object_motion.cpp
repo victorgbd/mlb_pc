@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +13,8 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/host_shaders/motion_resolve_comp.h"
 
 namespace Vulkan {
 
@@ -74,6 +78,10 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
     }
     params_mapped = static_cast<u32*>(mapped);
     std::memset(params_mapped, 0, 32);
+    // MLB (BB_MLB_TEMPORAL): skinned meshes get new normal/tangent streams every frame.
+    if (const char* mlb = std::getenv("BB_MLB_TEMPORAL"); mlb && mlb[0] == '1') {
+        history.loose_geometry = true;
+    }
     Shader::MotionVectors::params_address = params_address;
     Shader::MotionVectors::positions_address = positions_address;
     enabled = true;
@@ -98,12 +106,12 @@ void ObjectMotion::OnFrameStart() {
     if (BbStats::enabled && (frame % 600) == 0 && history.stats.draws) {
         const auto& s = history.stats;
         std::printf("Object motion: %llu draws, %llu stored, %llu with history, %llu unmatched, "
-                    "%llu capacity skips, %llu invalid, %llu still (600 frames); last frame %u/%u vertices; "
+                    "%llu capacity skips, %llu invalid, %llu still, %llu by index list (600 frames); last frame %u/%u vertices; "
                     "index ranges %llu reused, %llu scanned (%llu found changed), %zu cached\n",
                     (unsigned long long)s.draws, (unsigned long long)s.stored,
                     (unsigned long long)s.loaded, (unsigned long long)s.unmatched,
                     (unsigned long long)s.exhausted, (unsigned long long)s.invalid,
-                    (unsigned long long)s.still,
+                    (unsigned long long)s.still, (unsigned long long)s.loose,
                     history.Used(), PositionsPerFrame, (unsigned long long)index_ranges.stats.hits,
                     (unsigned long long)index_ranges.stats.scans,
                     (unsigned long long)index_ranges.stats.stale, index_ranges.Size());
@@ -142,6 +150,21 @@ u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
         return 0;
     }
     const auto allocation = history.Prepare(draw);
+    // BB_MOTION_UNMATCHED_LOG=1: the draws without history in two consecutive frames every
+    // 1200, to see which part of their identity changes between frames.
+    static const bool unmatched_log = [] {
+        const char* env = std::getenv("BB_MOTION_UNMATCHED_LOG");
+        return env && env[0] == '1';
+    }();
+    if (unmatched_log && frame % 1200 < 2) {
+        std::printf("Motion %s f%llu: vs %08x geo %016llx stable %016llx idx %#llx topo %016llx "
+                    "n %u inst %u/%u range %d+%u\n",
+                    allocation.load ? "match" : "UNMATCHED", (unsigned long long)frame,
+                    u32(draw.shader), (unsigned long long)draw.geometry,
+                    (unsigned long long)draw.stable, (unsigned long long)draw.indices,
+                    (unsigned long long)draw.topology, draw.index_count, draw.instances,
+                    draw.first_instance, draw.vertices.first, draw.vertices.count);
+    }
     u32 flags = (allocation.store ? Shader::MotionVectors::FlagStore : 0) |
                 (allocation.load ? Shader::MotionVectors::FlagLoad : 0);
     if (!flags) {
@@ -162,8 +185,43 @@ u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
     return index;
 }
 
-void ObjectMotion::EnsureImage(u32 width, u32 height) {
-    if (image && width == image_width && height == image_height) {
+void ObjectMotion::CreateResolvePipeline() {
+    if (resolve_pipeline) {
+        return;
+    }
+    const auto device = instance.GetDevice();
+    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
+        {.binding = 0,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+    }};
+    resolve_desc_layout = Check(device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = u32(bindings.size()),
+        .pBindings = bindings.data(),
+    }));
+    resolve_pipeline_layout = Check(device.createPipelineLayoutUnique({
+        .setLayoutCount = 1,
+        .pSetLayouts = &*resolve_desc_layout,
+    }));
+    const auto module = CompileSPV(MOTION_RESOLVE_COMP, device);
+    resolve_pipeline = Check(device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                          .module = module,
+                          .pName = "main"},
+                .layout = *resolve_pipeline_layout,
+            }));
+    device.destroyShaderModule(module);
+}
+
+void ObjectMotion::EnsureImage(u32 width, u32 height, u32 samples) {
+    if (image && width == image_width && height == image_height && samples == image_samples) {
         return;
     }
     const auto device = instance.GetDevice();
@@ -171,6 +229,8 @@ void ObjectMotion::EnsureImage(u32 width, u32 height) {
         scheduler.Finish();
     }
     view.reset();
+    resolved_view.reset();
+    resolved_image = VideoCore::UniqueImage{};
     image_layout = vk::ImageLayout::eUndefined;
     image = VideoCore::UniqueImage(device, instance.GetAllocator());
     image.Create(vk::ImageCreateInfo{
@@ -179,10 +239,10 @@ void ObjectMotion::EnsureImage(u32 width, u32 height) {
         .extent = {width, height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
-        .samples = vk::SampleCountFlagBits::e1,
+        .samples = vk::SampleCountFlagBits(samples),
         .tiling = vk::ImageTiling::eOptimal,
         .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
-                 vk::ImageUsageFlagBits::eTransferSrc,
+                 (samples == 1 ? vk::ImageUsageFlagBits::eTransferSrc : vk::ImageUsageFlags{}),
         .initialLayout = vk::ImageLayout::eUndefined,
     });
     view = Check(device.createImageViewUnique({
@@ -191,14 +251,39 @@ void ObjectMotion::EnsureImage(u32 width, u32 height) {
         .format = vk::Format::eR32G32B32A32Sfloat,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     }));
+    if (samples > 1) {
+        // MLB's 4x MSAA scene: the compose pass reads sample 0 (as for the scene depth).
+        CreateResolvePipeline();
+        resolved_image = VideoCore::UniqueImage(device, instance.GetAllocator());
+        resolved_image.Create(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR32G32B32A32Sfloat,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+                     vk::ImageUsageFlagBits::eTransferSrc,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        });
+        resolved_view = Check(device.createImageViewUnique({
+            .image = vk::Image(resolved_image),
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR32G32B32A32Sfloat,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+        std::printf("Object motion: %ux%u attachment with %u samples\n", width, height, samples);
+    }
     image_width = width;
     image_height = height;
+    image_samples = samples;
     written = false;
 }
 
-void ObjectMotion::Attach(RenderState& state, u32 width, u32 height) {
+void ObjectMotion::Attach(RenderState& state, u32 width, u32 height, u32 samples) {
     constexpr u32 slot = Shader::MotionVectors::Output;
-    EnsureImage(width, height);
+    EnsureImage(width, height, std::max(samples, 1u));
     auto& attachment = state.color_attachments[slot];
     attachment = {};
     attachment.image_view = *view;
@@ -231,7 +316,7 @@ void ObjectMotion::Attach(RenderState& state, u32 width, u32 height) {
 
 vk::ImageView ObjectMotion::PrepareRead(vk::CommandBuffer cmdbuf, u32 width, u32 height,
                                         bool& valid) {
-    EnsureImage(std::max(image_width, 1u), std::max(image_height, 1u));
+    EnsureImage(std::max(image_width, 1u), std::max(image_height, 1u), image_samples);
     valid = written && width == image_width && height == image_height;
     const vk::ImageMemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -245,7 +330,47 @@ vk::ImageView ObjectMotion::PrepareRead(vk::CommandBuffer cmdbuf, u32 width, u32
     };
     cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
     image_layout = vk::ImageLayout::eGeneral;
-    return *view;
+    if (image_samples == 1) {
+        return *view;
+    }
+    // Sample 0 of each pixel into the one-sample image.
+    const auto resolved_barrier = [&](vk::ImageLayout old_layout, vk::PipelineStageFlags2 src,
+                                      vk::AccessFlags2 src_access, vk::AccessFlags2 dst_access) {
+        const vk::ImageMemoryBarrier2 b{
+            .srcStageMask = src,
+            .srcAccessMask = src_access,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = dst_access,
+            .oldLayout = old_layout,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = vk::Image(resolved_image),
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+    };
+    resolved_barrier(vk::ImageLayout::eUndefined, vk::PipelineStageFlagBits2::eAllCommands,
+                     vk::AccessFlagBits2::eNone, vk::AccessFlagBits2::eShaderWrite);
+    const vk::DescriptorImageInfo source_info{.imageView = *view,
+                                              .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo out_info{.imageView = *resolved_view,
+                                           .imageLayout = vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 2> writes = {{
+        {.dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &source_info},
+        {.dstBinding = 1,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &out_info},
+    }};
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *resolve_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *resolve_pipeline_layout, 0,
+                                writes);
+    cmdbuf.dispatch((image_width + 7) / 8, (image_height + 7) / 8, 1);
+    resolved_barrier(vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                     vk::AccessFlagBits2::eShaderWrite, vk::AccessFlagBits2::eShaderRead);
+    return *resolved_view;
 }
 
 } // namespace Vulkan

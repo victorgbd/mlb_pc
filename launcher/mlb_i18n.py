@@ -99,6 +99,11 @@ TRANSLATIONS = {
         'Not available': 'No disponible',
         'Nothing here yet.': 'Todavía no hay nada aquí.',
         'Off': 'Desactivado',
+        'Temporal anti-aliasing': 'Antialiasing temporal',
+        'FSR 3.1 (AMD, any graphics card)': 'FSR 3.1 (AMD, cualquier tarjeta gráfica)',
+        'XeSS (Intel, most graphics cards)': 'XeSS (Intel, la mayoría de tarjetas gráficas)',
+        "Smooths edges and shimmer using previous frames, with motion vectors for the camera and the players. Experimental: it costs FPS (about 25% on a GTX 1650) and, while on, the scene is drawn at the game's own size (the render resolution is ignored).":
+            'Suaviza los bordes y el parpadeo usando los fotogramas anteriores, con vectores de movimiento para la cámara y los jugadores. Experimental: cuesta FPS (alrededor de un 25 % en una GTX 1650) y, mientras está activo, la escena se dibuja al tamaño propio del juego (se ignora la resolución de renderizado).',
         'Original icon': 'Icono original',
         'PC PORT': 'PORT PARA PC',
         'PC port': 'port para PC',

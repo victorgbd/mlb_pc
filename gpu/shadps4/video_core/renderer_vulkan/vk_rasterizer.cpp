@@ -415,7 +415,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto& depth = texture_cache.GetImage(db_desc.first);
         // The game's render size: 1920x1080, or BB_GAME_RES (src/runtime_display.c).
         static const auto game_size = [] {
-            unsigned w = 1920, h = 1080;
+            // MLB: BB_MLB_RES (SceneResolution::Native), 1920x1080 otherwise.
+            unsigned w = SceneResolution::Native().width, h = SceneResolution::Native().height;
             if (const char* res = std::getenv("BB_GAME_RES")) {
                 unsigned pw = 0, ph = 0;
                 if (std::sscanf(res, "%ux%u", &pw, &ph) == 2 && pw >= 640 && ph >= 360) {
@@ -436,6 +437,14 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             (depth.info.pixel_format == vk::Format::eD32SfloatS8Uint ||
              depth.info.pixel_format == vk::Format::eD32Sfloat)) {
             camera_motion->OnGBufferPass(db_desc.first);
+            // MLB: pipelines drawing with this depth get the object motion attachment
+            // (PipelineCache, motion_possible).
+            if (camera_motion->ViewProjectionMode() &&
+                Shader::MotionVectors::scene_depth_address != depth.info.guest_address) {
+                Shader::MotionVectors::scene_depth_address = depth.info.guest_address;
+                std::printf("Object motion: scene depth at %#llx\n",
+                            static_cast<unsigned long long>(depth.info.guest_address));
+            }
         }
     }
     if (upscaler->Enabled() && cb_descs[0].first) {
@@ -1623,6 +1632,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }();
             scene_targets->UpscaleColors(rcas >= 0.0f, std::max(rcas, 0.0f));
         }
+        // BB_MLB_TEMPORAL: the temporal upscaler replaces the scene color before this pass
+        // (after FSR 1 above, which rebuilds the other reduced targets).
+        if (upscaler->Enabled()) {
+            upscaler->OnFinalPass();
+        }
         scene_started = false;
         // bbport: frame generation's inputs before the final pass (BB_FRAME_GEN_PS), while
         // this frame's scene depth is still known.
@@ -1645,6 +1659,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
+    motion_stable = 0;
+    motion_gpu_streams = false;
 
     {
         const u64 t = rest_start ? __rdtsc() : 0;
@@ -1864,18 +1880,22 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }();
         bool gated = !all_motion;
         u64 palette = 0;
+        // MLB: every scene draw is instrumented (PipelineCache), most of them static stadium
+        // pieces whose shaders bind large constant buffers: character-size skeletons are gated
+        // on their palette too (static geometry takes the camera's vectors).
+        const bool loose = camera_motion->ViewProjectionMode();
         for (const auto& resource : vs.buffers) {
             if (resource.IsSpecial()) continue;
             const auto buffer = resource.GetSharp(vs);
             const u32 size = buffer.GetSize();
             if (!buffer.Valid() || buffer.GetStride() != 16) continue;
             const auto role = Motion::ClassifyBuffer(size);
-            if (role == Motion::BufferRole::Skeleton) {
+            if (role == Motion::BufferRole::Skeleton && !loose) {
                 gated = false;
                 break;
             }
             const VAddr address = buffer.base_address;
-            if (role == Motion::BufferRole::SmallSkeleton &&
+            if (role != Motion::BufferRole::Other &&
                 memory->IsValidGpuMapping(address, 0) &&
                 memory->ClampRangeSize(address, size) == size) {
                 palette = XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size,
@@ -1883,8 +1903,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         }
         push_data.motion_param = 0;
+        // MLB: the static streams identify the mesh (motion_stable). Vertices the GPU wrote
+        // (simulated cloth: jerseys, pants) move with an unchanged bone palette: no gate.
+        if (loose && motion_gpu_streams) {
+            gated = false;
+        }
         if (!gated || object_motion->Moving({.shader = vs.pgm_hash,
-                                             .geometry = motion_geometry,
+                                             .geometry = loose ? motion_stable : motion_geometry,
                                              .indices = index_address,
                                              .index_count = regs.num_indices,
                                              .instances = regs.num_instances.NumInstances(),
@@ -1926,6 +1951,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 .instances = regs.num_instances.NumInstances(),
                 .first_instance = first_instance,
                 .vertices = range,
+                .stable = motion_stable,
             });
         }
     }
@@ -2079,6 +2105,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     // Indirect arguments may be GPU-written: leave these draws on camera fallback.
     motion_draw = false;
     motion_geometry = 0;
+    motion_stable = 0;
+    motion_gpu_streams = false;
     PrepareRenderState(pipeline);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
@@ -3057,6 +3085,28 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         motion_geometry = ready ? ready->buffers_hash
                                 : XXH3_64bits(guest_buffers.data(),
                                               guest_buffers.size() * sizeof(AmdGpu::Buffer));
+        // MLB: skinned meshes read normals/tangents that a compute shader rewrites into a new
+        // place every frame. The streams the GPU did not write identify the mesh across
+        // frames; a draw with only GPU-written streams (meshes rebuilt every frame) gets none.
+        motion_stable = 0;
+        motion_gpu_streams = false;
+        if (camera_motion->ViewProjectionMode()) {
+            u64 hash = 0, layout = 0;
+            bool any = false;
+            for (const auto& vb : guest_buffers) {
+                if (!buffer_cache.IsRegionGpuModified(vb.base_address, vb.GetSize())) {
+                    hash = XXH3_64bits_withSeed(&vb, sizeof(vb), hash);
+                    any = true;
+                } else {
+                    motion_gpu_streams = true;
+                }
+                const u64 shape[2] = {vb.GetStride(), vb.GetSize()};
+                layout = XXH3_64bits_withSeed(shape, sizeof(shape), layout);
+            }
+            // Bit 0: static streams; bit 1: only GPU-written streams (simulated cloth: the
+            // same vertices, new data), matched by their layout when unique in the frame.
+            motion_stable = any ? (hash | 1) & ~u64(2) : (layout & ~u64(3)) | 2;
+        }
     }
     // Object motion research: vertex streams of G-buffer draws.
     if (FrameCapture::Active() && gbuffer_draw) {
@@ -3405,9 +3455,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             std::fflush(stdout);
         }
     }
+    // bbport BB_MLB_TEMPORAL: MLB's scene vertex shaders bind the camera's view-projection in a
+    // 128-byte constant buffer (CameraMotion::OnViewProjection checks it).
+    const bool vp_capture = stage.sw_stage == Shader::SwStage::Vertex &&
+                            camera_motion->ViewProjectionMode() && db_desc.first &&
+                            db_desc.first == camera_motion->Depth();
+    const bool vp_y_up = Regs().viewports[0].yscale < 0.0f;
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
         const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
+        if (ring && vp_capture && ring->size == 128 && !desc.IsSpecial()) {
+            camera_motion->OnViewProjection(
+                reinterpret_cast<const float*>(constant_ring->Data(ring->offset)), vp_y_up);
+        }
         if (ring) {
             // Copied by the GPU command thread into the constant ring (read-only).
             static const bool ring_check = std::getenv("BB_RING_CHECK") != nullptr;
@@ -3502,6 +3562,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 memory->IsValidGpuMapping(vsharp.base_address, 0)) {
                 camera_motion->OnConstants(reinterpret_cast<const float*>(vsharp.base_address));
             }
+            if (vp_capture && vsharp.GetSize() == 128 && vsharp.base_address &&
+                memory->IsValidGpuMapping(vsharp.base_address, 128)) {
+                camera_motion->OnViewProjection(
+                    reinterpret_cast<const float*>(vsharp.base_address), vp_y_up);
+            }
             // Object motion research: the vertex shader buffers of G-buffer draws.
             if (FrameCapture::Active() && gbuffer_draw && stage.sw_stage == Shader::SwStage::Vertex &&
                 vsharp.base_address != 0 && memory->IsValidGpuMapping(vsharp.base_address, 0)) {
@@ -3512,6 +3577,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                               u32(stage.pgm_hash), binding.buffer,
                               (unsigned long long)vsharp.base_address, u32(vsharp.GetSize()),
                               u32(vsharp.GetStride()), f[0], f[1], f[2], f[3]);
+                FrameCapture::Note(note);
+            }
+            // bbport diagnosis (BB_CAPTURE_VSBUF=1): every draw's vertex shader buffers in the
+            // capture, and for the 128-byte view-projection + world block (MLB) the world matrix,
+            // to tell how characters are placed (docs/MLB_PORT.md, camera).
+            static const bool capture_vsbuf = std::getenv("BB_CAPTURE_VSBUF") != nullptr;
+            if (capture_vsbuf && FrameCapture::Active() && stage.sw_stage == Shader::SwStage::Vertex &&
+                vsharp.base_address != 0 && memory->IsValidGpuMapping(vsharp.base_address, 0)) {
+                const auto* f = reinterpret_cast<const float*>(vsharp.base_address);
+                char note[256];
+                if (vsharp.GetSize() == 128) {
+                    std::snprintf(note, sizeof(note),
+                                  "\n  vsb %08x s%u 128 P11 %g w diag %g %g %g t %g %g %g",
+                                  u32(stage.pgm_hash), binding.buffer, f[5], f[16], f[21], f[26],
+                                  f[28], f[29], f[30]);
+                } else {
+                    std::snprintf(note, sizeof(note), "\n  vsb %08x s%u %u stride %u",
+                                  u32(stage.pgm_hash), binding.buffer, u32(vsharp.GetSize()),
+                                  u32(vsharp.GetStride()));
+                }
                 FrameCapture::Note(note);
             }
             if (FrameCapture::Active() && vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
@@ -4635,7 +4720,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
     // bbport: object motion vector attachment of G-buffer pipelines.
     if (key.motion_vectors) {
-        object_motion->Attach(state, state.width, state.height);
+        object_motion->Attach(state, state.width, state.height, key.num_samples);
     }
     return state;
 }
@@ -4645,8 +4730,10 @@ void Rasterizer::Resolve() {
     const auto& mrt1_hint = CbExtent(1);
     VideoCore::TextureCache::ImageDesc mrt0_desc{Regs().color_buffers[0], mrt0_hint};
     VideoCore::TextureCache::ImageDesc mrt1_desc{Regs().color_buffers[1], mrt1_hint};
-    auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
-    auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
+    const VideoCore::ImageId mrt0_id = texture_cache.FindImage(mrt0_desc, true);
+    const VideoCore::ImageId mrt1_id = texture_cache.FindImage(mrt1_desc, true);
+    auto& mrt0_image = texture_cache.GetImage(mrt0_id);
+    auto& mrt1_image = texture_cache.GetImage(mrt1_id);
 
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  Regs().color_buffers[0].Address(),
@@ -4654,6 +4741,11 @@ void Rasterizer::Resolve() {
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
     ScopeMarkerEnd();
+    // bbport BB_MLB_TEMPORAL: MLB resolves its 4x MSAA scene color into the image its post and
+    // final pass read: the temporal upscaler works on that one-sample image.
+    if (upscaler->Enabled()) {
+        upscaler->OnResolve(mrt0_image.info.guest_address, mrt1_id);
+    }
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {

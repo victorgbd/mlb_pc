@@ -361,6 +361,8 @@ private:
     std::unique_ptr<ObjectMotion> object_motion;
     bool motion_draw = false;
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
+    u64 motion_stable{};      ///< MLB: identity of its streams the GPU did not write (0: none)
+    bool motion_gpu_streams{}; ///< MLB: the draw reads a vertex stream the GPU wrote
     bool gbuffer_draw = false;
     std::unique_ptr<TemporalUpscaler> upscaler; // bbport: FSR (docs/upscaler.md)
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
